@@ -4,6 +4,7 @@
 //! `src/main.rs` only handles process boundaries (argv parsing, exit codes).
 
 pub mod cli;
+pub mod doc;
 pub mod error;
 
 use crate::cli::{Cli, Command};
