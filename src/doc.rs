@@ -172,8 +172,8 @@ pub(crate) mod test_fixture {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             for (name, body) in [
                 ("[Content_Types].xml", CONTENT_TYPES),
                 ("_rels/.rels", ROOT_RELS),
@@ -224,8 +224,8 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::test_fixture::{
-        minimal_docx_bytes, missing_content_types_bytes, missing_document_bytes, CORE_XML,
-        DOCUMENT_RELS, DOCUMENT_XML, STYLES_XML,
+        CORE_XML, DOCUMENT_RELS, DOCUMENT_XML, STYLES_XML, minimal_docx_bytes,
+        missing_content_types_bytes, missing_document_bytes,
     };
     use super::*;
 
