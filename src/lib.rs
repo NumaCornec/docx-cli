@@ -91,7 +91,20 @@ pub fn run_add(args: cli::AddArgs, writer: &mut dyn Write) -> Result<(), DocxaiE
                 .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
             Ok(())
         }
-        AddKind::Table(_) => Err(DocxaiError::NotImplemented("add table")),
+        AddKind::Table(tbl) => {
+            let mut doc = Doc::load(&args.file)?;
+            let result = mutate::add_table(
+                &mut doc,
+                tbl.rows,
+                tbl.cols,
+                tbl.header.as_deref(),
+                tbl.position.after.as_deref(),
+                tbl.position.before.as_deref(),
+            )?;
+            writeln!(writer, "{result}")
+                .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
+            Ok(())
+        }
         AddKind::Image(_) => Err(DocxaiError::NotImplemented("add image")),
         AddKind::Equation(_) => Err(DocxaiError::NotImplemented("add equation")),
     }
@@ -122,6 +135,16 @@ pub fn run_set(args: cli::SetArgs, writer: &mut dyn Write) -> Result<(), DocxaiE
                 .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
             Ok(())
         }
+        Ref::TableCell { .. } => {
+            let text = args.text.as_deref().ok_or_else(|| {
+                DocxaiError::InvalidArgument("set @tN.rR.cC requires --text".into())
+            })?;
+            let mut doc = Doc::load(&args.file)?;
+            let result = mutate::set_table_cell(&mut doc, &args.reference, text)?;
+            writeln!(writer, "{result}")
+                .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
+            Ok(())
+        }
         _ => Err(DocxaiError::NotImplemented("set (this ref kind)")),
     }
 }
@@ -132,6 +155,13 @@ pub fn run_delete(args: cli::DeleteArgs, writer: &mut dyn Write) -> Result<(), D
         Ref::Paragraph(_) => {
             let mut doc = Doc::load(&args.file)?;
             let result = mutate::delete_paragraph(&mut doc, &args.reference)?;
+            writeln!(writer, "{result}")
+                .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
+            Ok(())
+        }
+        Ref::Table(_) | Ref::TableCell { .. } => {
+            let mut doc = Doc::load(&args.file)?;
+            let result = mutate::delete_table(&mut doc, &args.reference)?;
             writeln!(writer, "{result}")
                 .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
             Ok(())

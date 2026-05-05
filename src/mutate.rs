@@ -1,4 +1,4 @@
-//! Paragraph mutations for M2 (PRD #14–#18).
+//! Body mutations for M2 paragraphs (PRD #14–#18) and M3 tables (#21–#23).
 //!
 //! Operations on the `word/document.xml` part of a loaded [`Doc`].
 //! All mutations:
@@ -528,6 +528,307 @@ pub fn delete_paragraph(doc: &mut Doc, reference: &str) -> Result<serde_json::Va
 }
 
 // ---------------------------------------------------------------------------
+// Table mutations (M3: PRD #21–#23)
+// ---------------------------------------------------------------------------
+
+pub fn add_table(
+    doc: &mut Doc,
+    rows: u32,
+    cols: u32,
+    header: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
+) -> Result<serde_json::Value, DocxaiError> {
+    if rows == 0 || cols == 0 {
+        return Err(DocxaiError::InvalidArgument(
+            "rows and cols must be >= 1".into(),
+        ));
+    }
+
+    let map = index_body_spans(&doc.parts.document_xml)?;
+    let insert_pos = determine_insert_pos(&map, after, before)?;
+    let table_index = count_tables_before(&map.spans, insert_pos) + 1;
+    let new_ref = format!("@t{table_index}");
+
+    let header_cells: Option<Vec<String>> = header.map(|h| {
+        h.split(',')
+            .map(|s| s.trim().to_string())
+            .collect::<Vec<_>>()
+    });
+
+    let table_xml = build_table_xml(rows, cols, header_cells.as_deref())?;
+
+    let mut bytes = std::mem::take(&mut doc.parts.document_xml);
+    bytes.splice(insert_pos..insert_pos, table_xml.bytes());
+    doc.parts.document_xml = bytes;
+
+    doc.save(&doc.path)?;
+
+    let mut result = serde_json::json!({
+        "status": "ok",
+        "action": "add",
+        "ref": new_ref,
+        "kind": "table",
+    });
+
+    if let Some(cells) = &header_cells {
+        result["header"] = serde_json::json!(cells);
+    }
+
+    Ok(result)
+}
+
+pub fn set_table_cell(
+    doc: &mut Doc,
+    reference: &str,
+    text: &str,
+) -> Result<serde_json::Value, DocxaiError> {
+    let parsed = Ref::parse(reference)?;
+    let (table_idx, row, col) = match &parsed {
+        Ref::TableCell { table, row, col } => (*table, *row, *col),
+        _ => {
+            return Err(DocxaiError::InvalidArgument(format!(
+                "expected table cell ref (@tN.rR.cC), got {}",
+                reference
+            )));
+        }
+    };
+
+    let map = index_body_spans(&doc.parts.document_xml)?;
+    let table_span = find_span(&map.spans, &Ref::Table(table_idx))?;
+    let table_bytes = &doc.parts.document_xml[table_span.start..table_span.end];
+
+    let cells = index_table_cells(table_bytes)?;
+
+    let max_row = cells.iter().map(|c| c.row).max().unwrap_or(0);
+    let max_col = cells
+        .iter()
+        .filter(|c| c.row == 1)
+        .count() as u32;
+
+    let cell = cells
+        .iter()
+        .find(|c| c.row == row && c.col == col)
+        .ok_or_else(|| {
+            DocxaiError::InvalidArgument(format!(
+                "cell @t{table_idx}.r{row}.c{col} not found (table has {max_row} rows, {max_col} cols)"
+            ))
+        })?;
+
+    let cell_abs_start = table_span.start + cell.start;
+    let cell_abs_end = table_span.start + cell.end;
+    let cell_bytes = &doc.parts.document_xml[cell_abs_start..cell_abs_end];
+
+    let first_p_pos = find_first_paragraph_start(cell_bytes).ok_or_else(|| {
+        DocxaiError::Generic(format!("cell {} has no <w:p element", reference))
+    })?;
+
+    let tc_close_pos = rfind_subseq_offset(cell_bytes, b"</w:tc>").ok_or_else(|| {
+        DocxaiError::Generic(format!("cell {} has no </w:tc> closing tag", reference))
+    })?;
+
+    let runs = markdown::parse_runs(text)?;
+    let new_para = build_paragraph_xml(&runs, None);
+
+    let mut bytes = std::mem::take(&mut doc.parts.document_xml);
+    let replace_start = cell_abs_start + first_p_pos;
+    let replace_end = cell_abs_start + tc_close_pos;
+    bytes.splice(replace_start..replace_end, new_para.bytes());
+    doc.parts.document_xml = bytes;
+
+    doc.save(&doc.path)?;
+
+    Ok(serde_json::json!({
+        "status": "ok",
+        "action": "set",
+        "ref": reference,
+        "changed": ["text"],
+    }))
+}
+
+pub fn delete_table(doc: &mut Doc, reference: &str) -> Result<serde_json::Value, DocxaiError> {
+    let parsed = Ref::parse(reference)?;
+    match &parsed {
+        Ref::Table(_) => {}
+        Ref::TableCell { .. } => {
+            return Err(DocxaiError::InvalidArgument(
+                "delete on cells not supported, use set --text \"\" instead".into(),
+            ));
+        }
+        _ => {
+            return Err(DocxaiError::InvalidArgument(format!(
+                "expected table ref (@tN), got {}",
+                reference
+            )));
+        }
+    }
+
+    let map = index_body_spans(&doc.parts.document_xml)?;
+    let span = find_span(&map.spans, &parsed)?;
+
+    let mut bytes = std::mem::take(&mut doc.parts.document_xml);
+    bytes.splice(span.start..span.end, std::iter::empty::<u8>());
+    doc.parts.document_xml = bytes;
+
+    doc.save(&doc.path)?;
+
+    Ok(serde_json::json!({
+        "status": "ok",
+        "action": "delete",
+        "ref": reference,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Table XML building
+// ---------------------------------------------------------------------------
+
+fn build_table_xml(rows: u32, cols: u32, header_cells: Option<&[String]>) -> Result<String, DocxaiError> {
+    let mut xml = String::from("<w:tbl>");
+
+    xml.push_str("<w:tblPr>");
+    xml.push_str(r#"<w:tblStyle w:val="TableGrid"/>"#);
+    xml.push_str(r#"<w:tblW w:w="0" w:type="auto"/>"#);
+    xml.push_str("</w:tblPr>");
+
+    xml.push_str("<w:tblGrid>");
+    let col_width = 9000_u32.checked_div(cols).unwrap_or(3000);
+    for _ in 0..cols {
+        xml.push_str(&format!(r#"<w:gridCol w:w="{}"/>"#, col_width));
+    }
+    xml.push_str("</w:tblGrid>");
+
+    for r in 0..rows {
+        xml.push_str("<w:tr>");
+        for c in 0..cols {
+            let text = if r == 0 {
+                header_cells
+                    .and_then(|cells| cells.get(c as usize))
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+            } else {
+                ""
+            };
+            xml.push_str("<w:tc>");
+            if text.is_empty() {
+                xml.push_str("<w:p></w:p>");
+            } else {
+                let runs = markdown::parse_runs(text)?;
+                xml.push_str(&build_paragraph_xml(&runs, None));
+            }
+            xml.push_str("</w:tc>");
+        }
+        xml.push_str("</w:tr>");
+    }
+
+    xml.push_str("</w:tbl>");
+    Ok(xml)
+}
+
+struct CellSpan {
+    row: u32,
+    col: u32,
+    start: usize,
+    end: usize,
+}
+
+fn index_table_cells(table_xml: &[u8]) -> Result<Vec<CellSpan>, DocxaiError> {
+    let mut reader = Reader::from_reader(table_xml);
+    let mut buf = Vec::new();
+    let mut cells = Vec::new();
+
+    let mut row_count: u32 = 0;
+    let mut col_count: u32 = 0;
+    let mut pending_tc_start: Option<usize> = None;
+
+    loop {
+        let pos_before = reader.buffer_position() as usize;
+        let event = reader
+            .read_event_into(&mut buf)
+            .map_err(|e| DocxaiError::Generic(format!("table parse error: {e}")))?;
+        let pos_after = reader.buffer_position() as usize;
+
+        match event {
+            Event::Eof => break,
+            Event::Start(ref e) => {
+                let local = local_name(e.name().as_ref()).to_owned();
+                match local.as_slice() {
+                    b"tr" => {
+                        row_count += 1;
+                        col_count = 0;
+                    }
+                    b"tc" => {
+                        col_count += 1;
+                        pending_tc_start = Some(pos_before);
+                    }
+                    _ => {}
+                }
+            }
+            Event::End(ref e) => {
+                let local = local_name(e.name().as_ref()).to_owned();
+                if local.as_slice() == b"tc" {
+                    if let Some(start) = pending_tc_start.take() {
+                        cells.push(CellSpan {
+                            row: row_count,
+                            col: col_count,
+                            start,
+                            end: pos_after,
+                        });
+                    }
+                }
+            }
+            Event::Empty(ref e) => {
+                let local = local_name(e.name().as_ref()).to_owned();
+                if local.as_slice() == b"tc" {
+                    col_count += 1;
+                    cells.push(CellSpan {
+                        row: row_count,
+                        col: col_count,
+                        start: pos_before,
+                        end: pos_after,
+                    });
+                }
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(cells)
+}
+
+fn count_tables_before(spans: &[BodySpan], pos: usize) -> u32 {
+    spans.iter().filter(|s| s.kind == 't' && s.end <= pos).count() as u32
+}
+
+fn find_first_paragraph_start(bytes: &[u8]) -> Option<usize> {
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if let Some(offset) = find_subseq_offset_from(bytes, b"<w:p", pos) {
+            let after = offset + 4;
+            if after >= bytes.len() {
+                return Some(offset);
+            }
+            let next = bytes[after];
+            if next == b'>' || next == b' ' || next == b'/' {
+                return Some(offset);
+            }
+            pos = offset + 1;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+fn rfind_subseq_offset(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).rposition(|w| w == needle)
+}
+
+// ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
 
@@ -1046,5 +1347,327 @@ mod tests {
             }
             _ => panic!("expected paragraph"),
         }
+    }
+
+    // -- #21 add table --
+
+    #[test]
+    fn add_table_creates_table_with_dimensions() {
+        let (_tmp, mut doc) = load_doc();
+        let result = add_table(&mut doc, 3, 2, None, None, None).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["action"], "add");
+        assert_eq!(result["ref"], "@t1");
+        assert_eq!(result["kind"], "table");
+
+        let reloaded = Doc::load(doc.path).unwrap();
+        let map = index_body_spans(&reloaded.parts.document_xml).unwrap();
+        let t_spans: Vec<_> = map.spans.iter().filter(|s| s.kind == 't').collect();
+        assert_eq!(t_spans.len(), 1);
+
+        let tbl_bytes = &reloaded.parts.document_xml[t_spans[0].start..t_spans[0].end];
+        let s = std::str::from_utf8(tbl_bytes).unwrap();
+        assert!(s.contains("<w:tbl>"));
+        assert!(s.contains(r#"w:val="TableGrid""#));
+        assert!(s.contains("<w:gridCol"));
+    }
+
+    #[test]
+    fn add_table_with_header() {
+        let (_tmp, mut doc) = load_doc();
+        let result = add_table(&mut doc, 2, 3, Some("Name,Age,City"), None, None).unwrap();
+        assert_eq!(result["header"], serde_json::json!(["Name", "Age", "City"]));
+
+        let reloaded = Doc::load(doc.path).unwrap();
+        let map = index_body_spans(&reloaded.parts.document_xml).unwrap();
+        let t1 = map.spans.iter().find(|s| s.kind == 't').unwrap();
+        let tbl_bytes = &reloaded.parts.document_xml[t1.start..t1.end];
+        let s = std::str::from_utf8(tbl_bytes).unwrap();
+        assert!(s.contains("Name"));
+        assert!(s.contains("Age"));
+        assert!(s.contains("City"));
+    }
+
+    #[test]
+    fn add_table_rejects_zero_dimensions() {
+        let (_tmp, mut doc) = load_doc();
+        let err = add_table(&mut doc, 0, 3, None, None, None).unwrap_err();
+        assert!(matches!(err, DocxaiError::InvalidArgument(_)));
+
+        let err = add_table(&mut doc, 3, 0, None, None, None).unwrap_err();
+        assert!(matches!(err, DocxaiError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn add_table_after_ref() {
+        let xml =
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p></w:body>
+</w:document>"#;
+        let (_tmp, mut doc) = load_doc_with_xml(xml);
+        let result = add_table(&mut doc, 2, 2, None, Some("@p1"), None).unwrap();
+        assert_eq!(result["ref"], "@t1");
+
+        let reloaded = Doc::load(doc.path).unwrap();
+        let map = index_body_spans(&reloaded.parts.document_xml).unwrap();
+        assert_eq!(map.spans.len(), 3);
+        assert_eq!(map.spans[0].kind, 'p');
+        assert_eq!(map.spans[1].kind, 't');
+        assert_eq!(map.spans[2].kind, 'p');
+    }
+
+    #[test]
+    fn add_table_before_ref() {
+        let xml =
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p></w:body>
+</w:document>"#;
+        let (_tmp, mut doc) = load_doc_with_xml(xml);
+        let result = add_table(&mut doc, 1, 1, None, None, Some("@p2")).unwrap();
+        assert_eq!(result["ref"], "@t1");
+
+        let reloaded = Doc::load(doc.path).unwrap();
+        let map = index_body_spans(&reloaded.parts.document_xml).unwrap();
+        assert_eq!(map.spans[0].kind, 'p');
+        assert_eq!(map.spans[1].kind, 't');
+        assert_eq!(map.spans[2].kind, 'p');
+    }
+
+    #[test]
+    fn add_table_preserves_other_parts() {
+        let (_tmp, mut doc) = load_doc();
+        let orig_styles = doc.parts.styles_xml.clone();
+        let orig_rels = doc.parts.document_rels.clone();
+
+        add_table(&mut doc, 2, 2, None, None, None).unwrap();
+
+        let reloaded = Doc::load(doc.path).unwrap();
+        assert_eq!(reloaded.parts.styles_xml, orig_styles);
+        assert_eq!(reloaded.parts.document_rels, orig_rels);
+    }
+
+    // -- #22 set @tN.rR.cC --
+
+    fn load_doc_with_table() -> (NamedTempFile, Doc) {
+        let xml =
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="0" w:type="auto"/></w:tblPr>
+<w:tblGrid><w:gridCol w:w="4500"/><w:gridCol w:w="4500"/></w:tblGrid>
+<w:tr><w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B1</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:tc><w:p><w:r><w:t>A2</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B2</w:t></w:r></w:p></w:tc></w:tr>
+</w:tbl></w:body></w:document>"#;
+        load_doc_with_xml(xml)
+    }
+
+    #[test]
+    fn set_table_cell_text() {
+        let (_tmp, mut doc) = load_doc_with_table();
+        let result = set_table_cell(&mut doc, "@t1.r1.c1", "Updated").unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["action"], "set");
+        assert_eq!(result["ref"], "@t1.r1.c1");
+        assert_eq!(result["changed"], serde_json::json!(["text"]));
+
+        let reloaded = Doc::load(doc.path).unwrap();
+        let map = index_body_spans(&reloaded.parts.document_xml).unwrap();
+        let t1 = map.spans.iter().find(|s| s.kind == 't').unwrap();
+        let tbl_bytes = &reloaded.parts.document_xml[t1.start..t1.end];
+        let s = std::str::from_utf8(tbl_bytes).unwrap();
+        assert!(s.contains("Updated"), "should contain new text: {s}");
+        assert!(
+            !s.contains(">A1<"),
+            "old text should be gone: {s}"
+        );
+    }
+
+    #[test]
+    fn set_table_cell_preserves_cell_properties() {
+        let xml =
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="4500"/></w:tblGrid>
+<w:tr><w:tc><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="D9E2F3"/></w:tcPr><w:p><w:r><w:t>orig</w:t></w:r></w:p></w:tc></w:tr>
+</w:tbl></w:body></w:document>"#;
+        let (_tmp, mut doc) = load_doc_with_xml(xml);
+        set_table_cell(&mut doc, "@t1.r1.c1", "new text").unwrap();
+
+        let reloaded = Doc::load(doc.path).unwrap();
+        let map = index_body_spans(&reloaded.parts.document_xml).unwrap();
+        let t1 = map.spans.iter().find(|s| s.kind == 't').unwrap();
+        let tbl_bytes = &reloaded.parts.document_xml[t1.start..t1.end];
+        let s = std::str::from_utf8(tbl_bytes).unwrap();
+        assert!(s.contains("new text"), "new text present: {s}");
+        assert!(
+            s.contains(r#"w:fill="D9E2F3""#),
+            "cell shading preserved: {s}"
+        );
+    }
+
+    #[test]
+    fn set_table_cell_out_of_bounds_errors() {
+        let (_tmp, mut doc) = load_doc_with_table();
+        let err = set_table_cell(&mut doc, "@t1.r5.c1", "x").unwrap_err();
+        assert!(matches!(err, DocxaiError::InvalidArgument(_)));
+
+        let err = set_table_cell(&mut doc, "@t1.r1.c5", "x").unwrap_err();
+        assert!(matches!(err, DocxaiError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn set_table_cell_non_cell_ref_errors() {
+        let (_tmp, mut doc) = load_doc_with_table();
+        let err = set_table_cell(&mut doc, "@p1", "x").unwrap_err();
+        assert!(matches!(err, DocxaiError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn set_table_cell_with_markdown() {
+        let (_tmp, mut doc) = load_doc_with_table();
+        set_table_cell(&mut doc, "@t1.r2.c2", "**bold** cell").unwrap();
+
+        let reloaded = Doc::load(doc.path).unwrap();
+        let map = index_body_spans(&reloaded.parts.document_xml).unwrap();
+        let t1 = map.spans.iter().find(|s| s.kind == 't').unwrap();
+        let tbl_bytes = &reloaded.parts.document_xml[t1.start..t1.end];
+        let s = std::str::from_utf8(tbl_bytes).unwrap();
+        assert!(s.contains("<w:b/>"), "expected bold in cell: {s}");
+        assert!(s.contains("bold"), "expected bold text: {s}");
+    }
+
+    #[test]
+    fn set_table_cell_replaces_multiple_paragraphs() {
+        let xml =
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="4500"/></w:tblGrid>
+<w:tr><w:tc><w:p><w:r><w:t>para1</w:t></w:r></w:p><w:p><w:r><w:t>para2</w:t></w:r></w:p></w:tc></w:tr>
+</w:tbl></w:body></w:document>"#;
+        let (_tmp, mut doc) = load_doc_with_xml(xml);
+        set_table_cell(&mut doc, "@t1.r1.c1", "replaced").unwrap();
+
+        let reloaded = Doc::load(doc.path).unwrap();
+        let map = index_body_spans(&reloaded.parts.document_xml).unwrap();
+        let t1 = map.spans.iter().find(|s| s.kind == 't').unwrap();
+        let tbl_bytes = &reloaded.parts.document_xml[t1.start..t1.end];
+        let s = std::str::from_utf8(tbl_bytes).unwrap();
+        assert!(s.contains("replaced"));
+        assert!(
+            !s.contains("para1"),
+            "old paragraphs should be gone: {s}"
+        );
+        assert!(
+            !s.contains("para2"),
+            "old paragraphs should be gone: {s}"
+        );
+    }
+
+    // -- #23 delete @tN --
+
+    #[test]
+    fn delete_table_removes_element() {
+        let (_tmp, mut doc) = load_doc_with_table();
+        let result = delete_table(&mut doc, "@t1").unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["action"], "delete");
+        assert_eq!(result["ref"], "@t1");
+
+        let reloaded = Doc::load(doc.path).unwrap();
+        let map = index_body_spans(&reloaded.parts.document_xml).unwrap();
+        let t_spans: Vec<_> = map.spans.iter().filter(|s| s.kind == 't').collect();
+        assert!(t_spans.is_empty(), "table should be removed");
+    }
+
+    #[test]
+    fn delete_table_cell_ref_errors() {
+        let (_tmp, mut doc) = load_doc_with_table();
+        let err = delete_table(&mut doc, "@t1.r1.c1").unwrap_err();
+        assert!(matches!(err, DocxaiError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn delete_table_invalid_ref_errors() {
+        let (_tmp, mut doc) = load_doc_with_table();
+        let err = delete_table(&mut doc, "@t99").unwrap_err();
+        assert!(matches!(err, DocxaiError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn delete_table_refs_shift() {
+        let xml =
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="4500"/></w:tblGrid>
+<w:tr><w:tc><w:p><w:r><w:t>T1</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="4500"/></w:tblGrid>
+<w:tr><w:tc><w:p><w:r><w:t>T2</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+</w:body></w:document>"#;
+        let (_tmp, mut doc) = load_doc_with_xml(xml);
+        delete_table(&mut doc, "@t1").unwrap();
+
+        let reloaded = Doc::load(doc.path).unwrap();
+        let map = index_body_spans(&reloaded.parts.document_xml).unwrap();
+        let t_spans: Vec<_> = map.spans.iter().filter(|s| s.kind == 't').collect();
+        assert_eq!(t_spans.len(), 1);
+        assert_eq!(t_spans[0].index, 1);
+
+        let tbl_bytes = &reloaded.parts.document_xml[t_spans[0].start..t_spans[0].end];
+        let s = std::str::from_utf8(tbl_bytes).unwrap();
+        assert!(s.contains("T2"), "second table should remain");
+    }
+
+    // -- table helpers --
+
+    #[test]
+    fn build_table_xml_empty_2x3() {
+        let xml = build_table_xml(2, 3, None).unwrap();
+        assert!(xml.starts_with("<w:tbl>"));
+        assert!(xml.ends_with("</w:tbl>"));
+        assert!(xml.contains(r#"w:val="TableGrid""#));
+        assert!(xml.contains("<w:gridCol"));
+        let tr_count = xml.matches("<w:tr>").count();
+        assert_eq!(tr_count, 2);
+        let tc_count = xml.matches("<w:tc>").count();
+        assert_eq!(tc_count, 6);
+    }
+
+    #[test]
+    fn build_table_xml_with_header() {
+        let header = vec!["A".into(), "B".into()];
+        let xml = build_table_xml(3, 2, Some(&header)).unwrap();
+        assert!(xml.contains(">A<"));
+        assert!(xml.contains(">B<"));
+        assert_eq!(xml.matches("<w:tr>").count(), 3);
+    }
+
+    #[test]
+    fn index_table_cells_counts_correctly() {
+        let table_xml =
+            br#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="3000"/><w:gridCol w:w="3000"/></w:tblGrid>
+<w:tr><w:tc><w:p/></w:tc><w:tc><w:p/></w:tc></w:tr>
+<w:tr><w:tc><w:p/></w:tc><w:tc><w:p/></w:tc></w:tr></w:tbl>"#;
+        let cells = index_table_cells(table_xml).unwrap();
+        assert_eq!(cells.len(), 4);
+        assert_eq!(cells[0].row, 1);
+        assert_eq!(cells[0].col, 1);
+        assert_eq!(cells[1].row, 1);
+        assert_eq!(cells[1].col, 2);
+        assert_eq!(cells[2].row, 2);
+        assert_eq!(cells[2].col, 1);
+        assert_eq!(cells[3].row, 2);
+        assert_eq!(cells[3].col, 2);
+    }
+
+    #[test]
+    fn find_first_paragraph_start_skips_ppr() {
+        let cell = b"<w:tc><w:tcPr><w:shd/></w:tcPr><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc>";
+        let pos = find_first_paragraph_start(cell).unwrap();
+        let before = std::str::from_utf8(&cell[..pos]).unwrap();
+        assert!(before.contains("tcPr"), "tcPr should be before: {before}");
+        assert!(!before.contains("<w:p>"), "paragraph should start after: {before}");
+    }
+
+    #[test]
+    fn rfind_finds_last_occurrence() {
+        let hay = b"abc</w:tc>def</w:tc>";
+        let pos = rfind_subseq_offset(hay, b"</w:tc>").unwrap();
+        assert_eq!(pos, 13);
     }
 }
