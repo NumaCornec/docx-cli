@@ -17,6 +17,7 @@ use serde::Serialize;
 
 use crate::doc::Doc;
 use crate::error::DocxaiError;
+use crate::markdown::{self, Run};
 use crate::refs::Ref;
 use crate::styles;
 
@@ -271,14 +272,16 @@ struct ParagraphData {
 }
 
 /// Read a paragraph's interior, consuming events up to (and including)
-/// the matching `</w:p>`. Extracts pStyle and concatenates run text with
-/// minimal markdown for bold/italic.
+/// the matching `</w:p>`. Extracts pStyle and collects each `<w:r>` into a
+/// [`Run`], then renders the paragraph text via [`markdown::render_runs`]
+/// so the markdown subset (#11/#12) is the single source of truth for the
+/// run→string mapping.
 fn read_paragraph(
     reader: &mut Reader<&[u8]>,
     buf: &mut Vec<u8>,
 ) -> Result<ParagraphData, DocxaiError> {
     let mut style: Option<String> = None;
-    let mut text = String::new();
+    let mut runs: Vec<Run> = Vec::new();
 
     let mut in_run = false;
     let mut bold = false;
@@ -327,7 +330,7 @@ fn read_paragraph(
                     b"b" if in_run => bold = true,
                     b"i" if in_run => italic = true,
                     b"tab" if in_run => run_text.push('\t'),
-                    b"br" if in_run => run_text.push(' '),
+                    b"br" if in_run => run_text.push('\n'),
                     _ => {}
                 }
             }
@@ -343,14 +346,11 @@ fn read_paragraph(
                     b"t" => in_text = false,
                     b"r" => {
                         if !run_text.is_empty() {
-                            let escaped = escape_markdown(&run_text);
-                            let wrapped = match (bold, italic) {
-                                (true, true) => format!("***{escaped}***"),
-                                (true, false) => format!("**{escaped}**"),
-                                (false, true) => format!("*{escaped}*"),
-                                (false, false) => escaped,
-                            };
-                            text.push_str(&wrapped);
+                            runs.push(Run {
+                                text: std::mem::take(&mut run_text),
+                                bold,
+                                italic,
+                            });
                         }
                         in_run = false;
                     }
@@ -363,22 +363,10 @@ fn read_paragraph(
         buf.clear();
     }
 
-    Ok(ParagraphData { style, text })
-}
-
-/// Backslash-escape characters that have meaning in our markdown subset.
-fn escape_markdown(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\\' | '*' | '_' | '`' | '$' | '[' | ']' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
+    Ok(ParagraphData {
+        style,
+        text: markdown::render_runs(&runs),
+    })
 }
 
 struct TableInProgress {
@@ -706,14 +694,6 @@ mod tests {
         let (_tmp, doc) = load_minimal();
         let err = build_table_snapshot(&doc, "@t9").unwrap_err();
         assert!(matches!(err, DocxaiError::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn escape_markdown_special_chars() {
-        assert_eq!(
-            escape_markdown(r"a*b_c`d$e[f]g\h"),
-            r"a\*b\_c\`d\$e\[f\]g\\h"
-        );
     }
 
     #[test]
