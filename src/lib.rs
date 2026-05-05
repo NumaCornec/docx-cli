@@ -6,6 +6,7 @@
 pub mod cli;
 pub mod doc;
 pub mod error;
+pub mod markdown;
 pub mod refs;
 pub mod snapshot;
 pub mod styles;
