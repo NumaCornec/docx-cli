@@ -7,6 +7,7 @@ pub mod cli;
 pub mod doc;
 pub mod error;
 pub mod markdown;
+pub mod mutate;
 pub mod refs;
 pub mod snapshot;
 pub mod styles;
@@ -15,17 +16,18 @@ use std::io::{self, Write};
 
 use serde_json::json;
 
-use crate::cli::{Cli, Command, SnapshotArgs, StylesArgs};
+use crate::cli::{AddKind, Cli, Command, SnapshotArgs, StylesArgs};
 use crate::doc::Doc;
 use crate::error::DocxaiError;
+use crate::refs::Ref;
 
 /// Dispatch a parsed [`Cli`] to its handler.
 pub fn run(cli: Cli) -> Result<(), DocxaiError> {
     match cli.command {
         Command::Snapshot(args) => run_snapshot(args, &mut io::stdout().lock()),
-        Command::Add(_) => Err(DocxaiError::NotImplemented("add")),
-        Command::Set(_) => Err(DocxaiError::NotImplemented("set")),
-        Command::Delete(_) => Err(DocxaiError::NotImplemented("delete")),
+        Command::Add(args) => run_add(args, &mut io::stdout().lock()),
+        Command::Set(args) => run_set(args, &mut io::stdout().lock()),
+        Command::Delete(args) => run_delete(args, &mut io::stdout().lock()),
         Command::Styles(args) => run_styles(args, &mut io::stdout().lock()),
     }
 }
@@ -72,6 +74,70 @@ pub fn run_styles(args: StylesArgs, writer: &mut dyn Write) -> Result<(), Docxai
         .map_err(|e| DocxaiError::Generic(format!("serialize styles output: {e}")))?;
     writeln!(writer).map_err(|e| DocxaiError::Generic(format!("write styles output: {e}")))?;
     Ok(())
+}
+
+pub fn run_add(args: cli::AddArgs, writer: &mut dyn Write) -> Result<(), DocxaiError> {
+    match args.kind {
+        AddKind::Paragraph(para) => {
+            let mut doc = Doc::load(&args.file)?;
+            let result = mutate::add_paragraph(
+                &mut doc,
+                &para.text,
+                para.style.as_deref(),
+                para.position.after.as_deref(),
+                para.position.before.as_deref(),
+            )?;
+            writeln!(writer, "{result}")
+                .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
+            Ok(())
+        }
+        AddKind::Table(_) => Err(DocxaiError::NotImplemented("add table")),
+        AddKind::Image(_) => Err(DocxaiError::NotImplemented("add image")),
+        AddKind::Equation(_) => Err(DocxaiError::NotImplemented("add equation")),
+    }
+}
+
+pub fn run_set(args: cli::SetArgs, writer: &mut dyn Write) -> Result<(), DocxaiError> {
+    let parsed = Ref::parse(&args.reference)?;
+    match &parsed {
+        Ref::Paragraph(_) => {
+            if args.text.is_none() && args.style.is_none() {
+                return Err(DocxaiError::InvalidArgument(
+                    "set @pN requires at least one of --text or --style".into(),
+                ));
+            }
+            if args.width.is_some() || args.caption.is_some() || args.latex.is_some() {
+                return Err(DocxaiError::InvalidArgument(
+                    "unsupported option for ref kind paragraph".to_string(),
+                ));
+            }
+            let mut doc = Doc::load(&args.file)?;
+            let result = mutate::set_paragraph(
+                &mut doc,
+                &args.reference,
+                args.text.as_deref(),
+                args.style.as_deref(),
+            )?;
+            writeln!(writer, "{result}")
+                .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
+            Ok(())
+        }
+        _ => Err(DocxaiError::NotImplemented("set (this ref kind)")),
+    }
+}
+
+pub fn run_delete(args: cli::DeleteArgs, writer: &mut dyn Write) -> Result<(), DocxaiError> {
+    let parsed = Ref::parse(&args.reference)?;
+    match &parsed {
+        Ref::Paragraph(_) => {
+            let mut doc = Doc::load(&args.file)?;
+            let result = mutate::delete_paragraph(&mut doc, &args.reference)?;
+            writeln!(writer, "{result}")
+                .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
+            Ok(())
+        }
+        _ => Err(DocxaiError::NotImplemented("delete (this ref kind)")),
+    }
 }
 
 #[cfg(test)]
