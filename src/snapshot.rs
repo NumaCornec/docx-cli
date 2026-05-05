@@ -532,9 +532,7 @@ fn contains_subseq(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
     }
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle)
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 fn local_name(qname: &[u8]) -> &[u8] {
@@ -547,8 +545,8 @@ fn local_name(qname: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc::test_fixture::minimal_docx_bytes;
     use crate::doc::Doc;
+    use crate::doc::test_fixture::minimal_docx_bytes;
     use std::io::Write as _;
     use tempfile::NamedTempFile;
 
@@ -568,7 +566,11 @@ mod tests {
         assert_eq!(snap.available_styles, vec!["Title", "Body"]);
         assert_eq!(snap.body.len(), 1);
         match &snap.body[0] {
-            BodyItem::Paragraph { reference, style, text } => {
+            BodyItem::Paragraph {
+                reference,
+                style,
+                text,
+            } => {
                 assert_eq!(reference, "@p1");
                 assert_eq!(style.as_deref(), Some("Title"));
                 assert_eq!(text, "Hello");
@@ -626,7 +628,8 @@ mod tests {
 
     #[test]
     fn table_records_dimensions_and_header() {
-        let xml = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+        let xml =
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:body>
 <w:tbl>
   <w:tr>
@@ -643,11 +646,19 @@ mod tests {
 </w:body></w:document>"#;
         let idx = index_body(xml).unwrap();
         match &idx.items[0] {
-            BodyItem::Table { reference, rows, cols, header } => {
+            BodyItem::Table {
+                reference,
+                rows,
+                cols,
+                header,
+            } => {
                 assert_eq!(reference, "@t1");
                 assert_eq!(*rows, 2);
                 assert_eq!(*cols, 3);
-                assert_eq!(header, &vec!["Metric".to_string(), "Q3".into(), "Q4".into()]);
+                assert_eq!(
+                    header,
+                    &vec!["Metric".to_string(), "Q3".into(), "Q4".into()]
+                );
             }
             _ => panic!("expected table"),
         }
@@ -655,7 +666,8 @@ mod tests {
 
     #[test]
     fn table_snapshot_drills_cells_with_refs() {
-        let xml = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+        let xml =
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:body>
 <w:tbl>
   <w:tr>
@@ -698,15 +710,22 @@ mod tests {
 
     #[test]
     fn escape_markdown_special_chars() {
-        assert_eq!(escape_markdown(r"a*b_c`d$e[f]g\h"), r"a\*b\_c\`d\$e\[f\]g\\h");
+        assert_eq!(
+            escape_markdown(r"a*b_c`d$e[f]g\h"),
+            r"a\*b\_c\`d\$e\[f\]g\\h"
+        );
     }
 
     #[test]
     fn preserved_features_detects_footnotes_and_tracked_changes() {
         let (_tmp, doc) = load_minimal();
         let mut doc = doc;
-        doc.parts.others.insert("word/footnotes.xml".into(), b"<w:footnotes/>".to_vec());
-        doc.parts.others.insert("word/comments.xml".into(), b"<w:comments/>".to_vec());
+        doc.parts
+            .others
+            .insert("word/footnotes.xml".into(), b"<w:footnotes/>".to_vec());
+        doc.parts
+            .others
+            .insert("word/comments.xml".into(), b"<w:comments/>".to_vec());
         doc.parts.document_xml = br#"<w:document xmlns:w="x">
 <w:body><w:p><w:ins w:id="1"><w:r><w:t>x</w:t></w:r></w:ins></w:p></w:body>
 </w:document>"#

@@ -32,9 +32,11 @@ impl Ref {
             .ok_or_else(|| invalid(input, "missing leading '@'"))?;
 
         // Discriminate on the first byte. Body must be non-empty after '@'.
-        let first = body.as_bytes().first().copied().ok_or_else(|| {
-            invalid(input, "empty ref")
-        })?;
+        let first = body
+            .as_bytes()
+            .first()
+            .copied()
+            .ok_or_else(|| invalid(input, "empty ref"))?;
 
         match first {
             b'p' => parse_simple(input, body, 'p').map(Ref::Paragraph),
@@ -85,9 +87,9 @@ fn parse_table_or_cell(input: &str, body: &str) -> Result<Ref, DocxaiError> {
         let table = parse_index(input, &rest[..dot], 't')?;
         let after = &rest[dot + 1..];
 
-        let r_dot = after.find('.').ok_or_else(|| {
-            invalid(input, "table cell ref needs '.rR.cC'")
-        })?;
+        let r_dot = after
+            .find('.')
+            .ok_or_else(|| invalid(input, "table cell ref needs '.rR.cC'"))?;
         let r_part = &after[..r_dot];
         let c_part = &after[r_dot + 1..];
 
@@ -123,7 +125,10 @@ fn parse_index(input: &str, digits: &str, sigil: char) -> Result<u32, DocxaiErro
         .parse()
         .map_err(|_| invalid(input, &format!("index after '{sigil}' overflows u32")))?;
     if n == 0 {
-        return Err(invalid(input, &format!("index after '{sigil}' must be >= 1")));
+        return Err(invalid(
+            input,
+            &format!("index after '{sigil}' must be >= 1"),
+        ));
     }
     Ok(n)
 }
@@ -157,11 +162,19 @@ mod tests {
     fn parses_table_cell() {
         assert_eq!(
             ok("@t1.r2.c3"),
-            Ref::TableCell { table: 1, row: 2, col: 3 }
+            Ref::TableCell {
+                table: 1,
+                row: 2,
+                col: 3
+            }
         );
         assert_eq!(
             ok("@t12.r34.c56"),
-            Ref::TableCell { table: 12, row: 34, col: 56 }
+            Ref::TableCell {
+                table: 12,
+                row: 34,
+                col: 56
+            }
         );
     }
 
@@ -229,12 +242,12 @@ mod tests {
     #[test]
     fn rejects_malformed_cell() {
         for s in [
-            "@t1.r2",      // missing .cC
-            "@t1.c2.r3",   // wrong order
+            "@t1.r2",       // missing .cC
+            "@t1.c2.r3",    // wrong order
             "@t1.r2.c3.x4", // trailing junk
-            "@t1..r2.c3",  // double dot
-            "@t1.r2.c3 ",  // trailing space
-            "@t1r2c3",     // missing dots
+            "@t1..r2.c3",   // double dot
+            "@t1.r2.c3 ",   // trailing space
+            "@t1r2c3",      // missing dots
         ] {
             assert!(
                 matches!(err(s), DocxaiError::InvalidArgument(_)),
@@ -273,7 +286,11 @@ mod tests {
             assert_eq!(ok(&format!("@e{n}")), Ref::Equation(n));
             assert_eq!(
                 ok(&format!("@t{n}.r{n}.c{n}")),
-                Ref::TableCell { table: n, row: n, col: n }
+                Ref::TableCell {
+                    table: n,
+                    row: n,
+                    col: n
+                }
             );
             count += 5;
         }
@@ -285,31 +302,67 @@ mod tests {
     fn sweep_50_invalid_refs() {
         let cases = [
             // missing prefix
-            "p1", "t1", "", " @p1", "@",
+            "p1",
+            "t1",
+            "",
+            " @p1",
+            "@",
             // wrong sigil
-            "@x1", "@P1", "@T1", "@I1", "@E1", "@1",
+            "@x1",
+            "@P1",
+            "@T1",
+            "@I1",
+            "@E1",
+            "@1",
             // missing index
-            "@p", "@t", "@i", "@e",
+            "@p",
+            "@t",
+            "@i",
+            "@e",
             // zero / negative / signed
-            "@p0", "@t0", "@i0", "@e0", "@p-1", "@p+1",
+            "@p0",
+            "@t0",
+            "@i0",
+            "@e0",
+            "@p-1",
+            "@p+1",
             // leading zero
-            "@p01", "@t02", "@i03",
+            "@p01",
+            "@t02",
+            "@i03",
             // float / hex / non-ascii digits
-            "@p1.5", "@p0x1", "@p一",
+            "@p1.5",
+            "@p0x1",
+            "@p一",
             // table cell malformations
-            "@t1.r0.c1", "@t1.r1.c0", "@t0.r1.c1",
-            "@t1.r2", "@t1.c2.r3", "@t1..r2.c3",
-            "@t1.r.c1", "@t1.r1.c", "@t1r2c3",
-            "@t1.x2.c3", "@t1.r2.x3", "@t1.r2.c3.x4",
+            "@t1.r0.c1",
+            "@t1.r1.c0",
+            "@t0.r1.c1",
+            "@t1.r2",
+            "@t1.c2.r3",
+            "@t1..r2.c3",
+            "@t1.r.c1",
+            "@t1.r1.c",
+            "@t1r2c3",
+            "@t1.x2.c3",
+            "@t1.r2.x3",
+            "@t1.r2.c3.x4",
             // whitespace
-            "@p 1", "@p1 ", " @p1", "@ p1",
+            "@p 1",
+            "@p1 ",
+            " @p1",
+            "@ p1",
             // overflow
             "@p4294967296",
             // junk after a valid prefix
-            "@p1abc", "@t1abc", "@i1abc", "@e1abc",
+            "@p1abc",
+            "@t1abc",
+            "@i1abc",
+            "@e1abc",
             "@t1.r2.c3abc",
             // upper-case row/col
-            "@t1.R2.c3", "@t1.r2.C3",
+            "@t1.R2.c3",
+            "@t1.r2.C3",
         ];
         assert!(cases.len() >= 50, "need >=50 cases, got {}", cases.len());
         for s in cases {
