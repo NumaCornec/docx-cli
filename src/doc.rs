@@ -9,8 +9,11 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+use tempfile::NamedTempFile;
+use zip::write::SimpleFileOptions;
 
 use crate::error::DocxaiError;
 
@@ -117,6 +120,85 @@ impl Doc {
             },
         })
     }
+
+    /// Atomically write the document to `path`.
+    ///
+    /// PRD §6.3 #2: write to a sibling temp file in the same directory, then
+    /// atomically `rename()` it into place via [`NamedTempFile::persist`]. If
+    /// any step before persist fails, the temp file is dropped (cleaned up)
+    /// and the target path is left untouched — never half-written.
+    ///
+    /// Re-zip order is fixed for reproducibility: `[Content_Types].xml`,
+    /// `word/document.xml`, then the optional well-known parts in declaration
+    /// order, then every `parts.others` entry in `BTreeMap` (path-sorted)
+    /// order. PRD §11: untouched parts round-trip byte-for-byte.
+    ///
+    /// Errors map to PRD §10.1 exit codes: any IO/zip failure →
+    /// [`DocxaiError::Generic`] (exit 1).
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), DocxaiError> {
+        let path = path.as_ref();
+        let parent = path.parent().ok_or_else(|| {
+            DocxaiError::Generic(format!("cannot determine parent dir of {}", path.display()))
+        })?;
+        // An empty parent (e.g. a bare filename like "out.docx") means CWD.
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+
+        let tmp = NamedTempFile::new_in(parent).map_err(|e| {
+            DocxaiError::Generic(format!(
+                "cannot create temp file in {}: {e}",
+                parent.display()
+            ))
+        })?;
+
+        // Scope the ZipWriter so it flushes / drops before we persist the temp.
+        {
+            let mut zip = zip::ZipWriter::new(tmp.as_file());
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+            let write_entry = |zip: &mut zip::ZipWriter<&File>,
+                               name: &str,
+                               body: &[u8]|
+             -> Result<(), DocxaiError> {
+                zip.start_file(name, opts)
+                    .map_err(|e| DocxaiError::Generic(format!("zip start_file {name}: {e}")))?;
+                zip.write_all(body)
+                    .map_err(|e| DocxaiError::Generic(format!("zip write {name}: {e}")))?;
+                Ok(())
+            };
+
+            write_entry(&mut zip, CONTENT_TYPES_PATH, &self.parts.content_types)?;
+            write_entry(&mut zip, DOCUMENT_PATH, &self.parts.document_xml)?;
+            if let Some(bytes) = self.parts.styles_xml.as_deref() {
+                write_entry(&mut zip, STYLES_PATH, bytes)?;
+            }
+            if let Some(bytes) = self.parts.document_rels.as_deref() {
+                write_entry(&mut zip, DOCUMENT_RELS_PATH, bytes)?;
+            }
+            if let Some(bytes) = self.parts.core_props.as_deref() {
+                write_entry(&mut zip, CORE_PROPS_PATH, bytes)?;
+            }
+            for (name, bytes) in &self.parts.others {
+                write_entry(&mut zip, name, bytes)?;
+            }
+
+            zip.finish()
+                .map_err(|e| DocxaiError::Generic(format!("zip finish: {e}")))?;
+        }
+
+        // Make sure the bytes are on disk before we rename over the target.
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| DocxaiError::Generic(format!("fsync temp: {e}")))?;
+
+        tmp.persist(path)
+            .map_err(|e| DocxaiError::Generic(format!("persist {}: {e}", path.display())))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -172,8 +254,8 @@ pub(crate) mod test_fixture {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             for (name, body) in [
                 ("[Content_Types].xml", CONTENT_TYPES),
                 ("_rels/.rels", ROOT_RELS),
@@ -224,8 +306,8 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::test_fixture::{
-        minimal_docx_bytes, missing_content_types_bytes, missing_document_bytes, CORE_XML,
-        DOCUMENT_RELS, DOCUMENT_XML, STYLES_XML,
+        CORE_XML, DOCUMENT_RELS, DOCUMENT_XML, STYLES_XML, minimal_docx_bytes,
+        missing_content_types_bytes, missing_document_bytes,
     };
     use super::*;
 
@@ -295,5 +377,89 @@ mod tests {
         let err = Doc::load("/nonexistent/path/does-not-exist.docx")
             .expect_err("missing file should fail");
         assert!(err.to_string().contains("cannot open"));
+    }
+
+    #[test]
+    fn save_roundtrip_preserves_well_known_parts() {
+        let src = write_tmp(&minimal_docx_bytes());
+        let original = Doc::load(src.path()).expect("load minimal");
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.docx");
+        original.save(&target).expect("save should succeed");
+
+        let reloaded = Doc::load(&target).expect("reload saved doc");
+
+        assert_eq!(reloaded.parts.content_types, original.parts.content_types);
+        assert_eq!(reloaded.parts.document_xml, original.parts.document_xml);
+        assert_eq!(reloaded.parts.styles_xml, original.parts.styles_xml);
+        assert_eq!(reloaded.parts.document_rels, original.parts.document_rels);
+        assert_eq!(reloaded.parts.core_props, original.parts.core_props);
+    }
+
+    #[test]
+    fn save_roundtrip_preserves_others_map() {
+        let src = write_tmp(&minimal_docx_bytes());
+        let original = Doc::load(src.path()).expect("load minimal");
+        // Sanity: `_rels/.rels` is captured in `others` (see load test above).
+        assert!(original.parts.others.contains_key("_rels/.rels"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.docx");
+        original.save(&target).expect("save should succeed");
+
+        let reloaded = Doc::load(&target).expect("reload saved doc");
+        assert_eq!(reloaded.parts.others, original.parts.others);
+    }
+
+    #[test]
+    fn save_overwrites_existing_file() {
+        let src = write_tmp(&minimal_docx_bytes());
+        let original = Doc::load(src.path()).expect("load minimal");
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.docx");
+        std::fs::write(&target, b"GARBAGE NOT A ZIP").expect("seed garbage");
+
+        original.save(&target).expect("save must overwrite garbage");
+
+        let reloaded = Doc::load(&target).expect("reload after overwrite");
+        assert_eq!(reloaded.parts.content_types, original.parts.content_types);
+        assert_eq!(reloaded.parts.document_xml, original.parts.document_xml);
+        assert_eq!(reloaded.parts.styles_xml, original.parts.styles_xml);
+        assert_eq!(reloaded.parts.document_rels, original.parts.document_rels);
+        assert_eq!(reloaded.parts.core_props, original.parts.core_props);
+        assert_eq!(reloaded.parts.others, original.parts.others);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_atomic_does_not_leave_partial_on_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let src = write_tmp(&minimal_docx_bytes());
+        let doc = Doc::load(src.path()).expect("load minimal");
+
+        let dir = tempfile::tempdir().unwrap();
+        // Make the directory read+exec but not writable so NamedTempFile::new_in fails.
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), perms).expect("chmod 0555");
+
+        let target = dir.path().join("out.docx");
+        let err = doc
+            .save(&target)
+            .expect_err("save into read-only dir must fail");
+        assert_eq!(err.exit_code(), crate::error::ExitCode::Generic);
+        assert!(
+            !target.exists(),
+            "no half-written file must remain at {}",
+            target.display()
+        );
+
+        // Restore writable perms so TempDir::drop can clean up.
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o755);
+        let _ = std::fs::set_permissions(dir.path(), perms);
     }
 }
