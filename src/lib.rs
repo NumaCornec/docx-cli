@@ -6,6 +6,7 @@
 pub mod cli;
 pub mod doc;
 pub mod error;
+pub mod markdown;
 pub mod refs;
 pub mod snapshot;
 pub mod styles;
@@ -69,8 +70,7 @@ pub fn run_styles(args: StylesArgs, writer: &mut dyn Write) -> Result<(), Docxai
     let payload = json!({ "styles": styles });
     serde_json::to_writer(&mut *writer, &payload)
         .map_err(|e| DocxaiError::Generic(format!("serialize styles output: {e}")))?;
-    writeln!(writer)
-        .map_err(|e| DocxaiError::Generic(format!("write styles output: {e}")))?;
+    writeln!(writer).map_err(|e| DocxaiError::Generic(format!("write styles output: {e}")))?;
     Ok(())
 }
 

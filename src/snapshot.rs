@@ -17,6 +17,7 @@ use serde::Serialize;
 
 use crate::doc::Doc;
 use crate::error::DocxaiError;
+use crate::markdown::{self, Run};
 use crate::refs::Ref;
 use crate::styles;
 
@@ -271,14 +272,16 @@ struct ParagraphData {
 }
 
 /// Read a paragraph's interior, consuming events up to (and including)
-/// the matching `</w:p>`. Extracts pStyle and concatenates run text with
-/// minimal markdown for bold/italic.
+/// the matching `</w:p>`. Extracts pStyle and collects each `<w:r>` into a
+/// [`Run`], then renders the paragraph text via [`markdown::render_runs`]
+/// so the markdown subset (#11/#12) is the single source of truth for the
+/// run→string mapping.
 fn read_paragraph(
     reader: &mut Reader<&[u8]>,
     buf: &mut Vec<u8>,
 ) -> Result<ParagraphData, DocxaiError> {
     let mut style: Option<String> = None;
-    let mut text = String::new();
+    let mut runs: Vec<Run> = Vec::new();
 
     let mut in_run = false;
     let mut bold = false;
@@ -327,7 +330,7 @@ fn read_paragraph(
                     b"b" if in_run => bold = true,
                     b"i" if in_run => italic = true,
                     b"tab" if in_run => run_text.push('\t'),
-                    b"br" if in_run => run_text.push(' '),
+                    b"br" if in_run => run_text.push('\n'),
                     _ => {}
                 }
             }
@@ -343,14 +346,11 @@ fn read_paragraph(
                     b"t" => in_text = false,
                     b"r" => {
                         if !run_text.is_empty() {
-                            let escaped = escape_markdown(&run_text);
-                            let wrapped = match (bold, italic) {
-                                (true, true) => format!("***{escaped}***"),
-                                (true, false) => format!("**{escaped}**"),
-                                (false, true) => format!("*{escaped}*"),
-                                (false, false) => escaped,
-                            };
-                            text.push_str(&wrapped);
+                            runs.push(Run {
+                                text: std::mem::take(&mut run_text),
+                                bold,
+                                italic,
+                            });
                         }
                         in_run = false;
                     }
@@ -363,22 +363,10 @@ fn read_paragraph(
         buf.clear();
     }
 
-    Ok(ParagraphData { style, text })
-}
-
-/// Backslash-escape characters that have meaning in our markdown subset.
-fn escape_markdown(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\\' | '*' | '_' | '`' | '$' | '[' | ']' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
+    Ok(ParagraphData {
+        style,
+        text: markdown::render_runs(&runs),
+    })
 }
 
 struct TableInProgress {
@@ -532,9 +520,7 @@ fn contains_subseq(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
     }
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle)
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 fn local_name(qname: &[u8]) -> &[u8] {
@@ -547,8 +533,8 @@ fn local_name(qname: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc::test_fixture::minimal_docx_bytes;
     use crate::doc::Doc;
+    use crate::doc::test_fixture::minimal_docx_bytes;
     use std::io::Write as _;
     use tempfile::NamedTempFile;
 
@@ -568,7 +554,11 @@ mod tests {
         assert_eq!(snap.available_styles, vec!["Title", "Body"]);
         assert_eq!(snap.body.len(), 1);
         match &snap.body[0] {
-            BodyItem::Paragraph { reference, style, text } => {
+            BodyItem::Paragraph {
+                reference,
+                style,
+                text,
+            } => {
                 assert_eq!(reference, "@p1");
                 assert_eq!(style.as_deref(), Some("Title"));
                 assert_eq!(text, "Hello");
@@ -626,7 +616,8 @@ mod tests {
 
     #[test]
     fn table_records_dimensions_and_header() {
-        let xml = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+        let xml =
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:body>
 <w:tbl>
   <w:tr>
@@ -643,11 +634,19 @@ mod tests {
 </w:body></w:document>"#;
         let idx = index_body(xml).unwrap();
         match &idx.items[0] {
-            BodyItem::Table { reference, rows, cols, header } => {
+            BodyItem::Table {
+                reference,
+                rows,
+                cols,
+                header,
+            } => {
                 assert_eq!(reference, "@t1");
                 assert_eq!(*rows, 2);
                 assert_eq!(*cols, 3);
-                assert_eq!(header, &vec!["Metric".to_string(), "Q3".into(), "Q4".into()]);
+                assert_eq!(
+                    header,
+                    &vec!["Metric".to_string(), "Q3".into(), "Q4".into()]
+                );
             }
             _ => panic!("expected table"),
         }
@@ -655,7 +654,8 @@ mod tests {
 
     #[test]
     fn table_snapshot_drills_cells_with_refs() {
-        let xml = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+        let xml =
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:body>
 <w:tbl>
   <w:tr>
@@ -697,16 +697,15 @@ mod tests {
     }
 
     #[test]
-    fn escape_markdown_special_chars() {
-        assert_eq!(escape_markdown(r"a*b_c`d$e[f]g\h"), r"a\*b\_c\`d\$e\[f\]g\\h");
-    }
-
-    #[test]
     fn preserved_features_detects_footnotes_and_tracked_changes() {
         let (_tmp, doc) = load_minimal();
         let mut doc = doc;
-        doc.parts.others.insert("word/footnotes.xml".into(), b"<w:footnotes/>".to_vec());
-        doc.parts.others.insert("word/comments.xml".into(), b"<w:comments/>".to_vec());
+        doc.parts
+            .others
+            .insert("word/footnotes.xml".into(), b"<w:footnotes/>".to_vec());
+        doc.parts
+            .others
+            .insert("word/comments.xml".into(), b"<w:comments/>".to_vec());
         doc.parts.document_xml = br#"<w:document xmlns:w="x">
 <w:body><w:p><w:ins w:id="1"><w:r><w:t>x</w:t></w:r></w:ins></w:p></w:body>
 </w:document>"#
