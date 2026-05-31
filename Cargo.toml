@@ -1,12 +1,12 @@
 [package]
 name = "docxai"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["docxai contributors"]
 description = "CLI for AI agents to create and modify .docx files via a minimal, deterministic, composable surface."
 license = "Apache-2.0"
-repository = "https://github.com/docxai/docxai"
+repository = "https://github.com/NumaCornec/docx-cli"
 readme = "README.md"
 keywords = ["docx", "ooxml", "word", "cli", "agent"]
 categories = ["command-line-utilities", "text-processing"]

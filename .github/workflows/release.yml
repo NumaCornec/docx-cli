@@ -1,0 +1,55 @@
+name: Release
+
+# Builds cross-platform `docxai` binaries and attaches them to a GitHub Release
+# whenever a version tag (e.g. v0.1.0) is pushed.
+"on":
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  upload-binaries:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Builds in release mode, packages the binary (.tar.gz on Unix, .zip on
+      # Windows) alongside README/LICENSE, generates a SHA-256 checksum, and
+      # uploads everything to the Release for the pushed tag (creating it if
+      # needed). Cross targets such as aarch64-linux are built via `cross`.
+      - name: Build and upload
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: docxai
+          target: ${{ matrix.target }}
+          archive: docxai-$tag-$target
+          include: README.md,LICENSE
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
