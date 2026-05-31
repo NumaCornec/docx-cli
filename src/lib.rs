@@ -5,7 +5,9 @@
 
 pub mod cli;
 pub mod doc;
+pub mod equation;
 pub mod error;
+pub mod image;
 pub mod markdown;
 pub mod mutate;
 pub mod refs;
@@ -105,8 +107,32 @@ pub fn run_add(args: cli::AddArgs, writer: &mut dyn Write) -> Result<(), DocxaiE
                 .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
             Ok(())
         }
-        AddKind::Image(_) => Err(DocxaiError::NotImplemented("add image")),
-        AddKind::Equation(_) => Err(DocxaiError::NotImplemented("add equation")),
+        AddKind::Image(img) => {
+            let mut doc = Doc::load(&args.file)?;
+            let result = image::add_image(
+                &mut doc,
+                &img.path,
+                img.width.as_deref(),
+                img.caption.as_deref(),
+                img.position.after.as_deref(),
+                img.position.before.as_deref(),
+            )?;
+            writeln!(writer, "{result}")
+                .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
+            Ok(())
+        }
+        AddKind::Equation(eq) => {
+            let mut doc = Doc::load(&args.file)?;
+            let result = equation::add_equation(
+                &mut doc,
+                &eq.latex,
+                eq.position.after.as_deref(),
+                eq.position.before.as_deref(),
+            )?;
+            writeln!(writer, "{result}")
+                .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
+            Ok(())
+        }
     }
 }
 
@@ -145,7 +171,51 @@ pub fn run_set(args: cli::SetArgs, writer: &mut dyn Write) -> Result<(), DocxaiE
                 .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
             Ok(())
         }
-        _ => Err(DocxaiError::NotImplemented("set (this ref kind)")),
+        Ref::Image(_) => {
+            if args.text.is_some() || args.style.is_some() || args.latex.is_some() {
+                return Err(DocxaiError::InvalidArgument(
+                    "unsupported option for ref kind image".to_string(),
+                ));
+            }
+            if args.width.is_none() && args.caption.is_none() {
+                return Err(DocxaiError::InvalidArgument(
+                    "set @iN requires at least one of --width or --caption".into(),
+                ));
+            }
+            let mut doc = Doc::load(&args.file)?;
+            let result = image::set_image(
+                &mut doc,
+                &args.reference,
+                args.width.as_deref(),
+                args.caption.as_deref(),
+            )?;
+            writeln!(writer, "{result}")
+                .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
+            Ok(())
+        }
+        Ref::Equation(_) => {
+            let latex = args
+                .latex
+                .as_deref()
+                .ok_or_else(|| DocxaiError::InvalidArgument("set @eN requires --latex".into()))?;
+            if args.text.is_some()
+                || args.style.is_some()
+                || args.width.is_some()
+                || args.caption.is_some()
+            {
+                return Err(DocxaiError::InvalidArgument(
+                    "unsupported option for ref kind equation".to_string(),
+                ));
+            }
+            let mut doc = Doc::load(&args.file)?;
+            let result = equation::set_equation(&mut doc, &args.reference, latex)?;
+            writeln!(writer, "{result}")
+                .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
+            Ok(())
+        }
+        Ref::Table(_) => Err(DocxaiError::InvalidArgument(
+            "set @tN is not supported; use @tN.rR.cC to set cell text".into(),
+        )),
     }
 }
 
@@ -166,7 +236,20 @@ pub fn run_delete(args: cli::DeleteArgs, writer: &mut dyn Write) -> Result<(), D
                 .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
             Ok(())
         }
-        _ => Err(DocxaiError::NotImplemented("delete (this ref kind)")),
+        Ref::Image(_) => {
+            let mut doc = Doc::load(&args.file)?;
+            let result = image::delete_image(&mut doc, &args.reference)?;
+            writeln!(writer, "{result}")
+                .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
+            Ok(())
+        }
+        Ref::Equation(_) => {
+            let mut doc = Doc::load(&args.file)?;
+            let result = equation::delete_equation(&mut doc, &args.reference)?;
+            writeln!(writer, "{result}")
+                .map_err(|e| DocxaiError::Generic(format!("write: {e}")))?;
+            Ok(())
+        }
     }
 }
 

@@ -16,11 +16,15 @@
 use crate::error::DocxaiError;
 
 /// One inline run extracted from / destined for `<w:r>`.
+///
+/// When `math` is true, `text` contains LaTeX source that should be converted
+/// to an inline `<m:oMath>` element (PRD #32).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
     pub text: String,
     pub bold: bool,
     pub italic: bool,
+    pub math: bool,
 }
 
 /// Render a sequence of runs to the markdown subset (PRD §9.1, used by snapshot).
@@ -29,6 +33,12 @@ pub fn render_runs(runs: &[Run]) -> String {
     let mut out = String::new();
     for run in runs {
         if run.text.is_empty() {
+            continue;
+        }
+        if run.math {
+            out.push('$');
+            out.push_str(&run.text);
+            out.push('$');
             continue;
         }
         let escaped = escape_markdown(&run.text);
@@ -121,9 +131,38 @@ pub fn parse_runs(input: &str) -> Result<Vec<Run>, DocxaiError> {
                 ));
             }
             b'$' => {
-                return Err(DocxaiError::InvalidArgument(
-                    "inline math ($...$) is not supported in the v0.1 markdown subset".into(),
-                ));
+                // Reject $$...$$ (display math) with hint.
+                if bytes.get(i + 1).copied() == Some(b'$') {
+                    return Err(DocxaiError::InvalidArgument(
+                        "display math ($$...$$) is not supported in --text; use `docxai add equation --latex`".into(),
+                    ));
+                }
+                // Find closing $ for inline math.
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len() && bytes[end] != b'$' {
+                    end += 1;
+                }
+                if end >= bytes.len() || bytes[end] != b'$' {
+                    return Err(DocxaiError::InvalidArgument(
+                        "unmatched $ for inline math".into(),
+                    ));
+                }
+                if start == end {
+                    return Err(DocxaiError::InvalidArgument(
+                        "empty inline math ($$) is not allowed; use $expr$".into(),
+                    ));
+                }
+                let latex = &input[start..end];
+                flush_run(&mut runs, &mut buf, bold, italic);
+                runs.push(Run {
+                    text: latex.to_string(),
+                    bold: false,
+                    italic: false,
+                    math: true,
+                });
+                i = end + 1;
+                continue;
             }
             b'[' | b']' | b'(' | b')' => {
                 // Parentheses on their own are fine prose, but in conjunction
@@ -262,7 +301,12 @@ fn flush_run(runs: &mut Vec<Run>, buf: &mut String, bold: bool, italic: bool) {
         return;
     }
     let text = std::mem::take(buf);
-    runs.push(Run { text, bold, italic });
+    runs.push(Run {
+        text,
+        bold,
+        italic,
+        math: false,
+    });
 }
 
 fn utf8_char_len(first_byte: u8) -> usize {
@@ -374,6 +418,16 @@ mod tests {
             text: text.to_string(),
             bold,
             italic,
+            math: false,
+        }
+    }
+
+    fn math_run(latex: &str) -> Run {
+        Run {
+            text: latex.to_string(),
+            bold: false,
+            italic: false,
+            math: true,
         }
     }
 
@@ -476,8 +530,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_runs_rejects_inline_math() {
-        let err = parse_runs("$x$").unwrap_err();
+    fn parse_runs_accepts_inline_math() {
+        let runs = parse_runs("soit $\\sigma$ la variance").unwrap();
+        assert_eq!(
+            runs,
+            vec![
+                run("soit ", false, false),
+                math_run("\\sigma"),
+                run(" la variance", false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_runs_rejects_display_math() {
+        let err = parse_runs("$$E=mc^2$$").unwrap_err();
+        assert!(matches!(err, DocxaiError::InvalidArgument(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("add equation"),
+            "should hint at add equation: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_runs_rejects_unmatched_math() {
+        let err = parse_runs("$unclosed").unwrap_err();
+        assert!(matches!(err, DocxaiError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn parse_runs_rejects_empty_math() {
+        let err = parse_runs("$$").unwrap_err();
         assert!(matches!(err, DocxaiError::InvalidArgument(_)));
     }
 
@@ -526,5 +610,31 @@ mod tests {
         let rendered = render_runs(&original);
         let parsed = parse_runs(&rendered).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn parse_runs_inline_math_roundtrip() {
+        let original = vec![
+            run("soit ", false, false),
+            math_run("\\sigma"),
+            run(" la variance", false, false),
+        ];
+        let rendered = render_runs(&original);
+        assert_eq!(rendered, r"soit $\sigma$ la variance");
+        let parsed = parse_runs(&rendered).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn parse_runs_math_with_bold() {
+        let runs = parse_runs("**bold** $x$").unwrap();
+        assert_eq!(
+            runs,
+            vec![
+                run("bold", true, false),
+                run(" ", false, false),
+                math_run("x"),
+            ]
+        );
     }
 }

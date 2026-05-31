@@ -21,6 +21,9 @@ use crate::markdown::{self, Run};
 use crate::refs::Ref;
 use crate::styles;
 
+const EMU_PER_CM: u64 = 360_000;
+const EMU_PER_INCH: u64 = 914_400;
+
 /// Top-level snapshot payload (§8.1).
 #[derive(Debug, Serialize)]
 pub struct Snapshot {
@@ -59,13 +62,32 @@ pub enum BodyItem {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         header: Vec<String>,
     },
+    Image {
+        #[serde(rename = "ref")]
+        reference: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        src: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption_ref: Option<String>,
+    },
+    Equation {
+        #[serde(rename = "ref")]
+        reference: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        latex: Option<String>,
+        display: bool,
+    },
 }
 
 impl BodyItem {
-    /// The ref string (`@p3`, `@t1`) — useful for `--table` lookup.
     pub fn reference(&self) -> &str {
         match self {
-            BodyItem::Paragraph { reference, .. } | BodyItem::Table { reference, .. } => reference,
+            BodyItem::Paragraph { reference, .. }
+            | BodyItem::Table { reference, .. }
+            | BodyItem::Image { reference, .. }
+            | BodyItem::Equation { reference, .. } => reference,
         }
     }
 }
@@ -102,7 +124,7 @@ pub struct TableLayout {
 }
 
 pub fn build_snapshot(doc: &Doc) -> Result<Snapshot, DocxaiError> {
-    let index = index_body(&doc.parts.document_xml)?;
+    let index = index_body(&doc.parts.document_xml, doc)?;
     let metadata = match doc.parts.core_props.as_deref() {
         Some(xml) => parse_core_metadata(xml)?,
         None => Metadata::default(),
@@ -135,7 +157,7 @@ pub fn build_table_snapshot(doc: &Doc, table_ref: &str) -> Result<TableSnapshot,
             )));
         }
     };
-    let index = index_body(&doc.parts.document_xml)?;
+    let index = index_body(&doc.parts.document_xml, doc)?;
     let table = index
         .tables
         .into_iter()
@@ -151,23 +173,45 @@ pub fn build_table_snapshot(doc: &Doc, table_ref: &str) -> Result<TableSnapshot,
     })
 }
 
+fn emu_to_width_string(emu: u64) -> String {
+    if emu == 0 {
+        return "0cm".to_string();
+    }
+    let cm = emu as f64 / EMU_PER_CM as f64;
+    if (cm - cm.round()).abs() < 0.01 {
+        format!("{}cm", cm as u64)
+    } else {
+        let inches = emu as f64 / EMU_PER_INCH as f64;
+        if inches < 1.0 || (inches - inches.round()).abs() < 0.01 {
+            format!("{inches:.1}in")
+        } else {
+            format!("{cm:.1}cm")
+        }
+    }
+}
+
 /// Walk `document.xml` and assemble ordered body items. We track the
 /// nesting depth ourselves so paragraphs *inside* a table cell are not
 /// counted as top-level paragraphs.
-fn index_body(xml: &[u8]) -> Result<BodyIndex, DocxaiError> {
+fn index_body(xml: &[u8], doc: &Doc) -> Result<BodyIndex, DocxaiError> {
     let mut reader = Reader::from_reader(xml);
     let mut buf = Vec::new();
 
-    let mut items = Vec::new();
+    let mut items: Vec<BodyItem> = Vec::new();
     let mut tables: Vec<TableLayout> = Vec::new();
     let mut p_count: u32 = 0;
     let mut t_count: u32 = 0;
+    let mut i_count: u32 = 0;
+    let mut e_count: u32 = 0;
 
     let mut in_body = false;
     let mut tbl_depth: u32 = 0;
 
     // Per-table state; valid only while tbl_depth > 0.
     let mut current_table: Option<TableInProgress> = None;
+
+    // Track the last image ref so we can link a Caption paragraph to it.
+    let mut last_image_ref: Option<String> = None;
 
     loop {
         let event = reader.read_event_into(&mut buf).map_err(|e| {
@@ -213,12 +257,57 @@ fn index_body(xml: &[u8]) -> Result<BodyIndex, DocxaiError> {
                 } else if local == b"p" {
                     // Top-level paragraph.
                     let para = read_paragraph(&mut reader, &mut buf)?;
-                    p_count += 1;
-                    items.push(BodyItem::Paragraph {
-                        reference: format!("@p{p_count}"),
-                        style: para.style,
-                        text: para.text,
-                    });
+
+                    if para.has_drawing {
+                        i_count += 1;
+                        let reference = format!("@i{i_count}");
+                        last_image_ref = Some(reference.clone());
+
+                        let src = para
+                            .blip_r_id
+                            .as_deref()
+                            .and_then(|rid| doc.get_relationship_target(rid));
+
+                        let width = para.extent_cx.map(emu_to_width_string);
+
+                        items.push(BodyItem::Image {
+                            reference,
+                            src,
+                            width,
+                            caption_ref: None,
+                        });
+                    } else if para.has_omath_para {
+                        e_count += 1;
+                        let reference = format!("@e{e_count}");
+                        items.push(BodyItem::Equation {
+                            reference,
+                            latex: None,
+                            display: true,
+                        });
+                    } else {
+                        p_count += 1;
+                        let reference = format!("@p{p_count}");
+
+                        // Check if this is a Caption paragraph following an image.
+                        if para.style.as_deref() == Some("Caption") {
+                            if let Some(_img_ref) = last_image_ref.take() {
+                                // Link caption to previous image.
+                                if let Some(BodyItem::Image { caption_ref, .. }) =
+                                    items.iter_mut().last()
+                                {
+                                    *caption_ref = Some(reference.clone());
+                                }
+                            }
+                        } else {
+                            last_image_ref = None;
+                        }
+
+                        items.push(BodyItem::Paragraph {
+                            reference,
+                            style: para.style,
+                            text: para.text,
+                        });
+                    }
                     continue;
                 }
             }
@@ -269,6 +358,10 @@ fn index_body(xml: &[u8]) -> Result<BodyIndex, DocxaiError> {
 struct ParagraphData {
     style: Option<String>,
     text: String,
+    has_drawing: bool,
+    has_omath_para: bool,
+    blip_r_id: Option<String>,
+    extent_cx: Option<u64>,
 }
 
 /// Read a paragraph's interior, consuming events up to (and including)
@@ -288,6 +381,10 @@ fn read_paragraph(
     let mut italic = false;
     let mut in_text = false;
     let mut run_text = String::new();
+    let mut has_drawing = false;
+    let mut has_omath_para = false;
+    let mut blip_r_id: Option<String> = None;
+    let mut extent_cx: Option<u64> = None;
 
     loop {
         let event = reader.read_event_into(buf).map_err(|e| {
@@ -308,6 +405,8 @@ fn read_paragraph(
                         run_text.clear();
                     }
                     b"t" if in_run => in_text = true,
+                    b"drawing" => has_drawing = true,
+                    b"oMathPara" => has_omath_para = true,
                     _ => {}
                 }
             }
@@ -331,6 +430,28 @@ fn read_paragraph(
                     b"i" if in_run => italic = true,
                     b"tab" if in_run => run_text.push('\t'),
                     b"br" if in_run => run_text.push('\n'),
+                    b"blip" => {
+                        for attr in e.attributes().flatten() {
+                            let key = local_name(attr.key.as_ref());
+                            if key.ends_with(b"embed") || key == b"embed" {
+                                if let Ok(val) = attr.decode_and_unescape_value(reader.decoder()) {
+                                    blip_r_id = Some(val.into_owned());
+                                }
+                            }
+                        }
+                    }
+                    b"extent" => {
+                        for attr in e.attributes().flatten() {
+                            if local_name(attr.key.as_ref()) == b"cx" {
+                                if let Ok(val) = std::str::from_utf8(&attr.value)
+                                    .unwrap_or("")
+                                    .parse::<u64>()
+                                {
+                                    extent_cx = Some(val);
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -350,6 +471,7 @@ fn read_paragraph(
                                 text: std::mem::take(&mut run_text),
                                 bold,
                                 italic,
+                                math: false,
                             });
                         }
                         in_run = false;
@@ -366,6 +488,10 @@ fn read_paragraph(
     Ok(ParagraphData {
         style,
         text: markdown::render_runs(&runs),
+        has_drawing,
+        has_omath_para,
+        blip_r_id,
+        extent_cx,
     })
 }
 
@@ -546,6 +672,25 @@ mod tests {
         (tmp, doc)
     }
 
+    fn doc_with_xml(xml: &[u8]) -> (NamedTempFile, Doc) {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&minimal_docx_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let mut doc = Doc::load(tmp.path()).unwrap();
+        doc.parts.document_xml = xml.to_vec();
+        (tmp, doc)
+    }
+
+    fn doc_with_xml_and_rels(xml: &[u8], rels: &[u8]) -> (NamedTempFile, Doc) {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&minimal_docx_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let mut doc = Doc::load(tmp.path()).unwrap();
+        doc.parts.document_xml = xml.to_vec();
+        doc.parts.document_rels = Some(rels.to_vec());
+        (tmp, doc)
+    }
+
     #[test]
     fn snapshot_minimal_fixture_has_one_paragraph() {
         let (_tmp, doc) = load_minimal();
@@ -587,7 +732,8 @@ mod tests {
 <w:r><w:rPr><w:i/></w:rPr><w:t>italic</w:t></w:r>
 </w:p>
 </w:body></w:document>"#;
-        let idx = index_body(xml).unwrap();
+        let (_tmp, doc) = doc_with_xml(xml);
+        let idx = index_body(xml, &doc).unwrap();
         match &idx.items[0] {
             BodyItem::Paragraph { text, .. } => {
                 assert_eq!(text, "plain **bold** and *italic*");
@@ -608,7 +754,8 @@ mod tests {
 </w:tbl>
 <w:p><w:r><w:t>three</w:t></w:r></w:p>
 </w:body></w:document>"#;
-        let idx = index_body(xml).unwrap();
+        let (_tmp, doc) = doc_with_xml(xml);
+        let idx = index_body(xml, &doc).unwrap();
         let refs: Vec<&str> = idx.items.iter().map(BodyItem::reference).collect();
         assert_eq!(refs, vec!["@p1", "@p2", "@t1", "@p3"]);
         // Paragraphs inside table cells must NOT consume @pN slots.
@@ -632,7 +779,8 @@ mod tests {
   </w:tr>
 </w:tbl>
 </w:body></w:document>"#;
-        let idx = index_body(xml).unwrap();
+        let (_tmp, doc) = doc_with_xml(xml);
+        let idx = index_body(xml, &doc).unwrap();
         match &idx.items[0] {
             BodyItem::Table {
                 reference,
@@ -714,5 +862,142 @@ mod tests {
         assert!(feats.contains(&"footnotes".to_string()));
         assert!(feats.contains(&"comments".to_string()));
         assert!(feats.contains(&"tracked_changes".to_string()));
+    }
+
+    #[test]
+    fn image_detected_in_snapshot() {
+        let xml = br#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+            xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+<w:body>
+<w:p><w:r><w:drawing><wp:inline><wp:extent cx="4320000" cy="3240000"/>
+<a:graphic><a:graphicData><wp:docPr id="1" name="Picture 1"/>
+<pic:pic xmlns:pic="..."><pic:blipFill><a:blip r:embed="rId5"/></pic:blipFill></pic:pic>
+</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
+</w:body></w:document>"#;
+        let rels = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+</Relationships>"#;
+        let (_tmp, doc) = doc_with_xml_and_rels(xml, rels);
+        let idx = index_body(xml, &doc).unwrap();
+        assert_eq!(idx.items.len(), 1);
+        match &idx.items[0] {
+            BodyItem::Image {
+                reference,
+                src,
+                width,
+                caption_ref,
+            } => {
+                assert_eq!(reference, "@i1");
+                assert_eq!(src.as_deref(), Some("media/image1.png"));
+                assert_eq!(width.as_deref(), Some("12cm"));
+                assert!(caption_ref.is_none());
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_with_caption_linked() {
+        let xml = br#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+            xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+<w:body>
+<w:p><w:r><w:drawing><wp:inline><wp:extent cx="3600000" cy="2700000"/>
+<a:graphic><a:graphicData><wp:docPr id="1" name="Picture 1"/>
+<pic:pic xmlns:pic="..."><pic:blipFill><a:blip r:embed="rId5"/></pic:blipFill></pic:pic>
+</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="Caption"/></w:pPr><w:r><w:t>Figure 1: Test</w:t></w:r></w:p>
+</w:body></w:document>"#;
+        let rels = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+</Relationships>"#;
+        let (_tmp, doc) = doc_with_xml_and_rels(xml, rels);
+        let idx = index_body(xml, &doc).unwrap();
+        assert_eq!(idx.items.len(), 2);
+        match &idx.items[0] {
+            BodyItem::Image {
+                reference,
+                caption_ref,
+                ..
+            } => {
+                assert_eq!(reference, "@i1");
+                assert_eq!(caption_ref.as_deref(), Some("@p1"));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+        match &idx.items[1] {
+            BodyItem::Paragraph {
+                reference, style, ..
+            } => {
+                assert_eq!(reference, "@p1");
+                assert_eq!(style.as_deref(), Some("Caption"));
+            }
+            other => panic!("expected Paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn images_and_paragraphs_numbered_independently() {
+        let xml = br#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+            xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+<w:body>
+<w:p><w:r><w:t>intro</w:t></w:r></w:p>
+<w:p><w:r><w:drawing><wp:inline><wp:extent cx="3600000" cy="2700000"/>
+<a:graphic><a:graphicData><pic:pic xmlns:pic="..."><pic:blipFill><a:blip r:embed="rId5"/></pic:blipFill></pic:pic>
+</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
+<w:p><w:r><w:t>after</w:t></w:r></w:p>
+</w:body></w:document>"#;
+        let rels = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+</Relationships>"#;
+        let (_tmp, doc) = doc_with_xml_and_rels(xml, rels);
+        let idx = index_body(xml, &doc).unwrap();
+        let refs: Vec<&str> = idx.items.iter().map(BodyItem::reference).collect();
+        assert_eq!(refs, vec!["@p1", "@i1", "@p2"]);
+    }
+
+    #[test]
+    fn emu_to_width_rounds_nicely() {
+        assert_eq!(emu_to_width_string(360_000), "1cm");
+        assert_eq!(emu_to_width_string(4_320_000), "12cm");
+        assert_eq!(emu_to_width_string(914_400), "1.0in");
+    }
+
+    #[test]
+    fn snapshot_detects_equation() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+  <w:body>
+    <w:p><w:r><w:t>Hello</w:t></w:r></w:p>
+    <w:p><m:oMathPara><m:oMath><m:r><m:t>E=mc^2</m:t></m:r></m:oMath></m:oMathPara></w:p>
+    <w:p><w:r><w:t>World</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let (_tmp, doc) = doc_with_xml(xml);
+        let snap = build_snapshot(&doc).unwrap();
+        assert_eq!(snap.body.len(), 3);
+
+        assert!(
+            matches!(&snap.body[0], BodyItem::Paragraph { reference, .. } if reference == "@p1")
+        );
+        assert!(
+            matches!(&snap.body[1], BodyItem::Equation { reference, display, .. }
+            if reference == "@e1" && *display)
+        );
+        assert!(
+            matches!(&snap.body[2], BodyItem::Paragraph { reference, .. } if reference == "@p2")
+        );
     }
 }

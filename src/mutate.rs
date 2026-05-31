@@ -19,20 +19,19 @@ use crate::styles;
 // Body indexing
 // ---------------------------------------------------------------------------
 
-struct BodySpan {
-    kind: char,
-    index: u32,
-    start: usize,
-    end: usize,
+pub(crate) struct BodySpan {
+    pub(crate) kind: char,
+    pub(crate) index: u32,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
-struct BodyMap {
-    spans: Vec<BodySpan>,
-    /// Byte offset of the first byte of `</w:body>`.
-    body_end: usize,
+pub(crate) struct BodyMap {
+    pub(crate) spans: Vec<BodySpan>,
+    pub(crate) body_end: usize,
 }
 
-fn index_body_spans(xml: &[u8]) -> Result<BodyMap, DocxaiError> {
+pub(crate) fn index_body_spans(xml: &[u8]) -> Result<BodyMap, DocxaiError> {
     let mut reader = Reader::from_reader(xml);
     let mut buf = Vec::new();
     let mut spans = Vec::new();
@@ -42,6 +41,8 @@ fn index_body_spans(xml: &[u8]) -> Result<BodyMap, DocxaiError> {
     let mut tbl_depth: u32 = 0;
     let mut p_count: u32 = 0;
     let mut t_count: u32 = 0;
+    let mut i_count: u32 = 0;
+    let mut e_count: u32 = 0;
     let mut pending_p_start: Option<usize> = None;
     let mut pending_t_start: Option<usize> = None;
 
@@ -59,7 +60,6 @@ fn index_body_spans(xml: &[u8]) -> Result<BodyMap, DocxaiError> {
                 match local.as_slice() {
                     b"body" => in_body = true,
                     b"p" if in_body && tbl_depth == 0 => {
-                        p_count += 1;
                         pending_p_start = Some(pos_before);
                     }
                     b"tbl" if in_body => {
@@ -81,9 +81,24 @@ fn index_body_spans(xml: &[u8]) -> Result<BodyMap, DocxaiError> {
                     }
                     b"p" if in_body && tbl_depth == 0 => {
                         if let Some(start) = pending_p_start.take() {
+                            let para_bytes = &xml[start..pos_after];
+                            let (kind, index) =
+                                if contains_any(para_bytes, &[b"<w:drawing>", b"<w:drawing "]) {
+                                    i_count += 1;
+                                    ('i', i_count)
+                                } else if contains_any(
+                                    para_bytes,
+                                    &[b"<m:oMathPara>", b"<m:oMathPara "],
+                                ) {
+                                    e_count += 1;
+                                    ('e', e_count)
+                                } else {
+                                    p_count += 1;
+                                    ('p', p_count)
+                                };
                             spans.push(BodySpan {
-                                kind: 'p',
-                                index: p_count,
+                                kind,
+                                index,
                                 start,
                                 end: pos_after,
                             });
@@ -125,13 +140,18 @@ fn index_body_spans(xml: &[u8]) -> Result<BodyMap, DocxaiError> {
     Ok(BodyMap { spans, body_end })
 }
 
-fn find_span<'a>(spans: &'a [BodySpan], parsed: &Ref) -> Result<&'a BodySpan, DocxaiError> {
+pub(crate) fn find_span<'a>(
+    spans: &'a [BodySpan],
+    parsed: &Ref,
+) -> Result<&'a BodySpan, DocxaiError> {
     let (kind, n) = match parsed {
         Ref::Paragraph(n) => ('p', *n),
         Ref::Table(n) => ('t', *n),
+        Ref::Image(n) => ('i', *n),
+        Ref::Equation(n) => ('e', *n),
         _ => {
             return Err(DocxaiError::InvalidArgument(format!(
-                "ref {} is not a paragraph or table",
+                "ref {} is not a top-level body ref",
                 parsed
             )));
         }
@@ -154,6 +174,16 @@ fn ref_not_found(parsed: &Ref, spans: &[BodySpan]) -> DocxaiError {
             let max = spans.iter().filter(|s| s.kind == 't').count();
             DocxaiError::InvalidArgument(format!("ref @t{n} not found (document has {max} tables)"))
         }
+        Ref::Image(n) => {
+            let max = spans.iter().filter(|s| s.kind == 'i').count();
+            DocxaiError::InvalidArgument(format!("ref @i{n} not found (document has {max} images)"))
+        }
+        Ref::Equation(n) => {
+            let max = spans.iter().filter(|s| s.kind == 'e').count();
+            DocxaiError::InvalidArgument(format!(
+                "ref @e{n} not found (document has {max} equations)"
+            ))
+        }
         _ => DocxaiError::InvalidArgument(format!("ref {parsed} not found")),
     }
 }
@@ -165,7 +195,7 @@ fn count_paragraphs_before(spans: &[BodySpan], pos: usize) -> u32 {
         .count() as u32
 }
 
-fn determine_insert_pos(
+pub(crate) fn determine_insert_pos(
     map: &BodyMap,
     after: Option<&str>,
     before: Option<&str>,
@@ -184,6 +214,14 @@ fn determine_insert_pos(
         (None, None) => Ok(map.body_end),
         _ => unreachable!("--after and --before are mutually exclusive per clap"),
     }
+}
+
+pub(crate) fn determine_insert_pos_from(
+    map: &BodyMap,
+    after: Option<&str>,
+    before: Option<&str>,
+) -> Result<usize, DocxaiError> {
+    determine_insert_pos(map, after, before)
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +245,11 @@ fn build_paragraph_xml(runs: &[Run], style: Option<&str>) -> String {
 fn emit_run_xml(xml: &mut String, run: &Run) {
     let text = &run.text;
     if text.is_empty() {
+        return;
+    }
+
+    if run.math {
+        emit_math_run(xml, text);
         return;
     }
 
@@ -261,6 +304,18 @@ fn emit_text_run(xml: &mut String, text: &str, bold: bool, italic: bool) {
 
 fn emit_break_run(xml: &mut String) {
     xml.push_str("<w:r><w:br/></w:r>");
+}
+
+fn emit_math_run(xml: &mut String, latex: &str) {
+    match crate::equation::latex_to_inline_omath(latex) {
+        Ok(omath) => xml.push_str(&omath),
+        Err(_) => {
+            let escaped = xml_escape_text(latex);
+            xml.push_str("<w:r><w:t>");
+            xml.push_str(&escaped);
+            xml.push_str("</w:t></w:r>");
+        }
+    }
 }
 
 fn emit_tab_run(xml: &mut String) {
@@ -372,11 +427,11 @@ pub fn add_paragraph(
             }
             Some(s.to_string())
         }
-        None => available
-            .iter()
-            .find(|s| s.as_str() == "Body")
-            .cloned()
-            .or_else(|| available.first().cloned()),
+        // PRD #14: default to "Body" when present. If the document has no
+        // "Body" style, leave the paragraph unstyled so it inherits the
+        // document default — never silently stamp an arbitrary first-listed
+        // style (which is often a heading).
+        None => available.iter().find(|s| s.as_str() == "Body").cloned(),
     };
 
     let xml = build_paragraph_xml(&runs, resolved_style.as_deref());
@@ -601,10 +656,7 @@ pub fn set_table_cell(
     let cells = index_table_cells(table_bytes)?;
 
     let max_row = cells.iter().map(|c| c.row).max().unwrap_or(0);
-    let max_col = cells
-        .iter()
-        .filter(|c| c.row == 1)
-        .count() as u32;
+    let max_col = cells.iter().filter(|c| c.row == 1).count() as u32;
 
     let cell = cells
         .iter()
@@ -619,9 +671,8 @@ pub fn set_table_cell(
     let cell_abs_end = table_span.start + cell.end;
     let cell_bytes = &doc.parts.document_xml[cell_abs_start..cell_abs_end];
 
-    let first_p_pos = find_first_paragraph_start(cell_bytes).ok_or_else(|| {
-        DocxaiError::Generic(format!("cell {} has no <w:p element", reference))
-    })?;
+    let first_p_pos = find_first_paragraph_start(cell_bytes)
+        .ok_or_else(|| DocxaiError::Generic(format!("cell {} has no <w:p element", reference)))?;
 
     let tc_close_pos = rfind_subseq_offset(cell_bytes, b"</w:tc>").ok_or_else(|| {
         DocxaiError::Generic(format!("cell {} has no </w:tc> closing tag", reference))
@@ -683,7 +734,11 @@ pub fn delete_table(doc: &mut Doc, reference: &str) -> Result<serde_json::Value,
 // Table XML building
 // ---------------------------------------------------------------------------
 
-fn build_table_xml(rows: u32, cols: u32, header_cells: Option<&[String]>) -> Result<String, DocxaiError> {
+fn build_table_xml(
+    rows: u32,
+    cols: u32,
+    header_cells: Option<&[String]>,
+) -> Result<String, DocxaiError> {
     let mut xml = String::from("<w:tbl>");
 
     xml.push_str("<w:tblPr>");
@@ -798,7 +853,17 @@ fn index_table_cells(table_xml: &[u8]) -> Result<Vec<CellSpan>, DocxaiError> {
 }
 
 fn count_tables_before(spans: &[BodySpan], pos: usize) -> u32 {
-    spans.iter().filter(|s| s.kind == 't' && s.end <= pos).count() as u32
+    spans
+        .iter()
+        .filter(|s| s.kind == 't' && s.end <= pos)
+        .count() as u32
+}
+
+pub(crate) fn count_images_before(spans: &[BodySpan], pos: usize) -> u32 {
+    spans
+        .iter()
+        .filter(|s| s.kind == 'i' && s.end <= pos)
+        .count() as u32
 }
 
 fn find_first_paragraph_start(bytes: &[u8]) -> Option<usize> {
@@ -961,6 +1026,34 @@ mod tests {
         let s = std::str::from_utf8(para_bytes).unwrap();
         assert!(s.contains("World"));
         assert!(s.contains(r#"w:val="Body""#));
+    }
+
+    #[test]
+    fn add_paragraph_no_body_style_leaves_paragraph_unstyled() {
+        // Regression: when no "Body" style exists and none is requested, the
+        // paragraph must inherit the document default — NOT silently adopt the
+        // first-listed style (which is often a heading).
+        let (_tmp, mut doc) = load_doc();
+        doc.parts.styles_xml = Some(
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+</w:styles>"#
+                .to_vec(),
+        );
+
+        let result = add_paragraph(&mut doc, "plain", None, None, None).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["style"], "");
+
+        let reloaded = Doc::load(doc.path).unwrap();
+        let map = index_body_spans(&reloaded.parts.document_xml).unwrap();
+        let p_spans: Vec<_> = map.spans.iter().filter(|s| s.kind == 'p').collect();
+        let para_bytes = &reloaded.parts.document_xml[p_spans[1].start..p_spans[1].end];
+        let s = std::str::from_utf8(para_bytes).unwrap();
+        assert!(s.contains("plain"));
+        assert!(!s.contains("<w:pStyle"), "expected no pStyle, got: {s}");
     }
 
     #[test]
@@ -1233,11 +1326,13 @@ mod tests {
                 text: "hello ".into(),
                 bold: false,
                 italic: false,
+                math: false,
             },
             Run {
                 text: "world".into(),
                 bold: true,
                 italic: false,
+                math: false,
             },
         ];
         let xml = build_paragraph_xml(&runs, Some("Body"));
@@ -1252,6 +1347,7 @@ mod tests {
             text: "plain".into(),
             bold: false,
             italic: false,
+            math: false,
         }];
         let xml = build_paragraph_xml(&runs, None);
         assert!(!xml.contains("<w:pPr>"));
@@ -1264,6 +1360,7 @@ mod tests {
             text: " leading space".into(),
             bold: false,
             italic: false,
+            math: false,
         }];
         let xml = build_paragraph_xml(&runs, None);
         assert!(xml.contains(r#"xml:space="preserve""#));
@@ -1275,6 +1372,7 @@ mod tests {
             text: "line1\nline2".into(),
             bold: false,
             italic: false,
+            math: false,
         }];
         let xml = build_paragraph_xml(&runs, None);
         assert!(xml.contains("<w:br/>"), "expected br element: {xml}");
@@ -1474,10 +1572,7 @@ mod tests {
         let tbl_bytes = &reloaded.parts.document_xml[t1.start..t1.end];
         let s = std::str::from_utf8(tbl_bytes).unwrap();
         assert!(s.contains("Updated"), "should contain new text: {s}");
-        assert!(
-            !s.contains(">A1<"),
-            "old text should be gone: {s}"
-        );
+        assert!(!s.contains(">A1<"), "old text should be gone: {s}");
     }
 
     #[test]
@@ -1549,14 +1644,8 @@ mod tests {
         let tbl_bytes = &reloaded.parts.document_xml[t1.start..t1.end];
         let s = std::str::from_utf8(tbl_bytes).unwrap();
         assert!(s.contains("replaced"));
-        assert!(
-            !s.contains("para1"),
-            "old paragraphs should be gone: {s}"
-        );
-        assert!(
-            !s.contains("para2"),
-            "old paragraphs should be gone: {s}"
-        );
+        assert!(!s.contains("para1"), "old paragraphs should be gone: {s}");
+        assert!(!s.contains("para2"), "old paragraphs should be gone: {s}");
     }
 
     // -- #23 delete @tN --
@@ -1661,7 +1750,10 @@ mod tests {
         let pos = find_first_paragraph_start(cell).unwrap();
         let before = std::str::from_utf8(&cell[..pos]).unwrap();
         assert!(before.contains("tcPr"), "tcPr should be before: {before}");
-        assert!(!before.contains("<w:p>"), "paragraph should start after: {before}");
+        assert!(
+            !before.contains("<w:p>"),
+            "paragraph should start after: {before}"
+        );
     }
 
     #[test]

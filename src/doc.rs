@@ -199,6 +199,104 @@ impl Doc {
             .map_err(|e| DocxaiError::Generic(format!("persist {}: {e}", path.display())))?;
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Relationship helpers
+    // -----------------------------------------------------------------------
+
+    /// Parse existing rId numbers from `document.xml.rels`, return max + 1.
+    pub fn next_rid_num(&self) -> u32 {
+        let rels = match self.parts.document_rels.as_deref() {
+            Some(r) => r,
+            None => return 1,
+        };
+        let s = std::str::from_utf8(rels).unwrap_or("");
+        let mut max_rid: u32 = 0;
+        for cap in regex::Regex::new(r#"Id="rId(\d+)""#)
+            .unwrap()
+            .captures_iter(s)
+        {
+            if let Ok(n) = cap[1].parse::<u32>() {
+                max_rid = max_rid.max(n);
+            }
+        }
+        max_rid + 1
+    }
+
+    /// Add a relationship to `document.xml.rels`. Returns the new rId string.
+    pub fn add_relationship(&mut self, target: &str, rel_type: &str) -> String {
+        let rid_num = self.next_rid_num();
+        let rid = format!("rId{rid_num}");
+        let entry = format!(r#"<Relationship Id="{rid}" Type="{rel_type}" Target="{target}"/>"#);
+        match self.parts.document_rels.as_deref() {
+            Some(rels) => {
+                let s = std::str::from_utf8(rels).unwrap_or("").to_owned();
+                let new_rels = if let Some(pos) = s.find("</Relationships>") {
+                    let mut out = String::with_capacity(s.len() + entry.len() + 1);
+                    out.push_str(&s[..pos]);
+                    out.push_str(&entry);
+                    out.push_str(&s[pos..]);
+                    out
+                } else {
+                    s.clone()
+                };
+                self.parts.document_rels = Some(new_rels.into_bytes());
+            }
+            None => {
+                let rels = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{entry}</Relationships>"#
+                );
+                self.parts.document_rels = Some(rels.into_bytes());
+            }
+        }
+        rid
+    }
+
+    /// Remove a relationship by rId from `document.xml.rels`.
+    pub fn remove_relationship(&mut self, r_id: &str) {
+        if let Some(rels) = self.parts.document_rels.as_deref() {
+            let s = std::str::from_utf8(rels).unwrap_or("");
+            let pattern = format!(r#"<Relationship Id="{r_id}""#);
+            if let Some(start) = s.find(&pattern) {
+                if let Some(end) = s[start..].find("/>") {
+                    let new_s = format!("{}{}", &s[..start], &s[start + end + 2..]);
+                    self.parts.document_rels = Some(new_s.into_bytes());
+                }
+            }
+        }
+    }
+
+    /// Look up the Target attribute for a given rId.
+    pub fn get_relationship_target(&self, r_id: &str) -> Option<String> {
+        let rels = self.parts.document_rels.as_deref()?;
+        let s = std::str::from_utf8(rels).ok()?;
+        let pattern = format!(r#"Id="{r_id}""#);
+        let pos = s.find(&pattern)?;
+        let after = &s[pos..];
+        let target_start = after.find(r#"Target=""#)? + 8;
+        let target_end = after[target_start..].find('"')?;
+        Some(after[target_start..target_start + target_end].to_string())
+    }
+
+    /// Ensure a `<Default>` entry for the given extension exists in
+    /// `[Content_Types].xml`.
+    pub fn ensure_content_type(&mut self, extension: &str, content_type: &str) {
+        let s = std::str::from_utf8(&self.parts.content_types)
+            .unwrap_or("")
+            .to_owned();
+        let pattern = format!(r#"Extension="{extension}""#);
+        if s.contains(&pattern) {
+            return;
+        }
+        let entry = format!(r#"<Default Extension="{extension}" ContentType="{content_type}"/>"#);
+        if let Some(pos) = s.find("</Types>") {
+            let mut out = String::with_capacity(s.len() + entry.len());
+            out.push_str(&s[..pos]);
+            out.push_str(&entry);
+            out.push_str(&s[pos..]);
+            self.parts.content_types = out.into_bytes();
+        }
+    }
 }
 
 #[cfg(test)]
