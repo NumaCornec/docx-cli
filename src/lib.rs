@@ -11,6 +11,7 @@ pub mod image;
 pub mod markdown;
 pub mod mutate;
 pub mod refs;
+pub mod skills;
 pub mod snapshot;
 pub mod styles;
 
@@ -31,6 +32,7 @@ pub fn run(cli: Cli) -> Result<(), DocxaiError> {
         Command::Set(args) => run_set(args, &mut io::stdout().lock()),
         Command::Delete(args) => run_delete(args, &mut io::stdout().lock()),
         Command::Styles(args) => run_styles(args, &mut io::stdout().lock()),
+        Command::Skills(args) => skills::run_skills(args, &mut io::stdout().lock()),
     }
 }
 
