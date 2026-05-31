@@ -213,7 +213,17 @@ docxai delete    <FILE> <REF>
 docxai styles    <FILE>
 ```
 
-5 verbes. Aucun ajout en v1.0 sans approbation explicite.
+5 verbes **documentaires**. Aucun ajout en v1.0 sans approbation explicite.
+
+En plus de ces cinq verbes, un verbe **méta/outillage** `skills` (calqué sur
+`glab skills`) installe les Agent Skills embarqués dans le binaire pour que les
+agents découvrent `docxai`. Il ne touche aucun `.docx` et n'entre pas dans le gel
+de la surface documentaire :
+
+```
+docxai skills list
+docxai skills install [NAME] [--force] [--global] [--path DIR]
+```
 
 ### 7.2 Sous-commandes `add`
 

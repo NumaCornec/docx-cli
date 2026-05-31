@@ -2,8 +2,9 @@
 
 A deterministic Rust CLI for AI agents to create and modify `.docx` (Word) files.
 
-`docxai` exposes exactly five verbs — `snapshot`, `add`, `set`, `delete`, `styles` —
-designed to be discovered and used by coding agents (Claude Code, Cursor, Codex CLI).
+`docxai` exposes exactly five document verbs — `snapshot`, `add`, `set`, `delete`,
+`styles` — designed to be discovered and used by coding agents (Claude Code, Cursor,
+Codex CLI), plus a `skills` tooling verb that installs the bundled agent skill.
 There are no LLM calls inside the binary; the agent drives `docxai` over Bash.
 
 ## Status
@@ -51,6 +52,23 @@ If no `--style` is given, `add paragraph` uses the document's `Body` style when
 present, otherwise leaves the paragraph unstyled to inherit the document default.
 
 Run `docxai --help` and `docxai <verb> --help` for the full reference.
+
+## Agent skills
+
+`docxai` ships an [Agent Skill](https://docs.gitlab.com/cli/skills/) that teaches
+coding agents how to drive it. The skill is embedded in the binary; install it
+into a repository so Claude Code, Codex, Gemini CLI, and other compatible agents
+discover it automatically (mirrors `glab skills`):
+
+```sh
+docxai skills list                       # show bundled skills
+docxai skills install                    # → <repo-root>/.agents/skills/
+docxai skills install --global           # → ~/.agents/skills/
+docxai skills install --path ./skills    # custom directory
+docxai skills install --force            # overwrite existing files
+```
+
+The skill source lives under [`skills/`](skills/) in this repository.
 
 ## Build & test
 

@@ -38,6 +38,12 @@ pub enum Command {
 
     /// List the named styles available in the document's `styles.xml`.
     Styles(StylesArgs),
+
+    /// Install the bundled agent skills so AI agents can discover docxai.
+    ///
+    /// Meta/tooling verb (mirrors `glab skills`); not a document-editing verb.
+    /// The five document verbs above stay frozen per PRD §7.1.
+    Skills(SkillsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -181,6 +187,39 @@ pub struct StylesArgs {
     pub file: PathBuf,
 }
 
+#[derive(Debug, Args)]
+pub struct SkillsArgs {
+    #[command(subcommand)]
+    pub command: SkillsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillsCommand {
+    /// Install bundled skills into `.agents/skills/` (or `--global` / `--path`).
+    Install(SkillsInstallArgs),
+
+    /// List every bundled skill with its description.
+    List,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillsInstallArgs {
+    /// Install only this skill by name (default: all bundled skills).
+    pub name: Option<String>,
+
+    /// Overwrite skill files that already exist at the target.
+    #[arg(short, long)]
+    pub force: bool,
+
+    /// Install at user scope in `~/.agents/skills/` instead of the repo.
+    #[arg(short, long)]
+    pub global: bool,
+
+    /// Install into a custom directory instead of `.agents/skills/`.
+    #[arg(long, value_name = "DIR")]
+    pub path: Option<PathBuf>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,14 +231,30 @@ mod tests {
     }
 
     #[test]
-    fn five_verbs_exist_at_top_level() {
+    fn five_document_verbs_are_frozen() {
         let cmd = Cli::command();
         let verbs: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
+        // PRD §7.1 freezes the five *document* verbs. `skills` is a meta/tooling
+        // verb (install bundled agent skills, mirrors `glab skills`) and is the
+        // only addition permitted alongside the frozen five.
+        assert_eq!(
+            &verbs[..5],
+            &["snapshot", "add", "set", "delete", "styles"],
+            "PRD §7.1 freezes these five document verbs and their order"
+        );
         assert_eq!(
             verbs,
-            vec!["snapshot", "add", "set", "delete", "styles"],
-            "PRD §7.1 freezes the verb list to exactly these five"
+            vec!["snapshot", "add", "set", "delete", "styles", "skills"],
+            "only `skills` may be added after the frozen five"
         );
+    }
+
+    #[test]
+    fn skills_has_install_and_list() {
+        let cmd = Cli::command();
+        let skills = cmd.find_subcommand("skills").expect("skills subcommand");
+        let subs: Vec<&str> = skills.get_subcommands().map(|s| s.get_name()).collect();
+        assert_eq!(subs, vec!["install", "list"]);
     }
 
     #[test]
