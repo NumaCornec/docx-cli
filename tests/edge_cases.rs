@@ -18,7 +18,10 @@ fn write_temp(bytes: &[u8]) -> NamedTempFile {
     tmp
 }
 
-fn make_minimal_docx() -> NamedTempFile {
+// Returns a TempPath (the OS file handle is closed) so the spawned `docxai`
+// binary can atomically replace the file on Windows, where renaming over a
+// still-open file is denied. The file is deleted when the TempPath drops.
+fn make_minimal_docx() -> tempfile::TempPath {
     let mut tmp = NamedTempFile::new().unwrap();
     let buf: Vec<u8> = Vec::new();
     let w = std::io::Cursor::new(buf);
@@ -72,7 +75,7 @@ fn make_minimal_docx() -> NamedTempFile {
     let buf = zip.finish().unwrap().into_inner();
     tmp.write_all(&buf).unwrap();
     tmp.flush().unwrap();
-    tmp
+    tmp.into_temp_path()
 }
 
 #[test]
@@ -143,7 +146,7 @@ fn missing_file_produces_clear_error() {
 fn invalid_ref_on_set_produces_error() {
     let tmp = make_minimal_docx();
     docxai()
-        .args(["set", tmp.path().to_str().unwrap(), "@p999", "--text", "x"])
+        .args(["set", tmp.to_str().unwrap(), "@p999", "--text", "x"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("not found").or(predicate::str::contains("error")));
@@ -153,7 +156,7 @@ fn invalid_ref_on_set_produces_error() {
 fn invalid_ref_on_delete_produces_error() {
     let tmp = make_minimal_docx();
     docxai()
-        .args(["delete", tmp.path().to_str().unwrap(), "@t999"])
+        .args(["delete", tmp.to_str().unwrap(), "@t999"])
         .assert()
         .failure();
 }
@@ -162,13 +165,7 @@ fn invalid_ref_on_delete_produces_error() {
 fn malformed_ref_produces_error() {
     let tmp = make_minimal_docx();
     docxai()
-        .args([
-            "set",
-            tmp.path().to_str().unwrap(),
-            "not_a_ref",
-            "--text",
-            "x",
-        ])
+        .args(["set", tmp.to_str().unwrap(), "not_a_ref", "--text", "x"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("invalid ref"));
@@ -191,7 +188,7 @@ fn garbage_binary_does_not_panic() {
 fn snapshot_on_minimal_docx_succeeds() {
     let tmp = make_minimal_docx();
     docxai()
-        .args(["snapshot", tmp.path().to_str().unwrap()])
+        .args(["snapshot", tmp.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"ref\":\"@p1\""));
@@ -201,7 +198,7 @@ fn snapshot_on_minimal_docx_succeeds() {
 fn styles_on_minimal_docx_succeeds() {
     let tmp = make_minimal_docx();
     docxai()
-        .args(["styles", tmp.path().to_str().unwrap()])
+        .args(["styles", tmp.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Title"));
@@ -213,7 +210,7 @@ fn add_paragraph_on_minimal_docx_succeeds() {
     docxai()
         .args([
             "add",
-            tmp.path().to_str().unwrap(),
+            tmp.to_str().unwrap(),
             "paragraph",
             "--text",
             "New paragraph",
@@ -227,13 +224,7 @@ fn add_paragraph_on_minimal_docx_succeeds() {
 fn set_paragraph_on_minimal_docx_succeeds() {
     let tmp = make_minimal_docx();
     docxai()
-        .args([
-            "set",
-            tmp.path().to_str().unwrap(),
-            "@p1",
-            "--text",
-            "Updated",
-        ])
+        .args(["set", tmp.to_str().unwrap(), "@p1", "--text", "Updated"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"status\":\"ok\""));
@@ -243,7 +234,7 @@ fn set_paragraph_on_minimal_docx_succeeds() {
 fn delete_paragraph_on_minimal_docx_succeeds() {
     let tmp = make_minimal_docx();
     docxai()
-        .args(["delete", tmp.path().to_str().unwrap(), "@p1"])
+        .args(["delete", tmp.to_str().unwrap(), "@p1"])
         .assert()
         .success();
 }

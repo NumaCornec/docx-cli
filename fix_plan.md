@@ -27,13 +27,17 @@ Tracker for autonomous development against `docxai-PRD.md`. Updated each loop.
 
 ### M2 — Paragraph mutations (v0.2.0)
 
-- [ ] **#12** Markdown subset parser (markdown → `<w:r>`)
-- [ ] **#13** `Doc::save()` atomic
-- [ ] **#14** `add paragraph` (append)
-- [ ] **#15** `add paragraph --after/--before`
-- [ ] **#16** `set @pN --text`
-- [ ] **#17** `set @pN --style`
-- [ ] **#18** `delete @pN`
+- [x] **#12** Markdown subset parser (markdown → `<w:r>`) — `src/markdown.rs`
+- [x] **#13** `Doc::save()` atomic — `src/doc.rs`
+- [x] **#14** `add paragraph` (append) — `src/mutate.rs`; defaults to `Body` when present, else unstyled (inherits document default)
+- [x] **#15** `add paragraph --after/--before` — `src/mutate.rs`
+- [x] **#16** `set @pN --text` — `src/mutate.rs`
+- [x] **#17** `set @pN --style` — `src/mutate.rs`
+- [x] **#18** `delete @pN` — `src/mutate.rs`
+
+Also landed beyond the M2 plan: `add table` + `set` table cells, inline images
+(`src/image.rs`), LaTeX display equations via pandoc (`src/equation.rs`), and an
+edge-case suite for malformed/partial docx (`tests/edge_cases.rs`).
 
 ### M3-M7
 

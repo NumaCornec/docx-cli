@@ -8,8 +8,25 @@ There are no LLM calls inside the binary; the agent drives `docxai` over Bash.
 
 ## Status
 
-Pre-alpha. The CLI surface is stubbed; verbs return a "not yet implemented"
-error while individual milestones land. See `docxai-PRD.md` for the full spec.
+Alpha. All five verbs are implemented and tested against synthetic fixtures:
+
+- `snapshot` — JSON body/styles/refs, `--pretty`, `--table @tN` drill-down
+- `styles` — list usable paragraph styles
+- `add` — `paragraph`, `table`, `image`, `equation` (with `--after`/`--before`)
+- `set` — edit paragraph text/style and table cells
+- `delete` — remove an element by ref
+
+Not yet verified against real Word/LibreOffice `.docx` output (synthetic
+fixtures only). See `docxai-PRD.md` for the full spec and `fix_plan.md` for
+milestone status.
+
+## Requirements
+
+- Rust 1.85+ (edition 2024).
+- **`pandoc`** — required only for `add equation` and equation round-tripping
+  in `snapshot` (LaTeX ↔ OOXML math). All other verbs work without it.
+  - macOS: `brew install pandoc` · Linux: `sudo apt install pandoc` ·
+    Windows: `winget install pandoc`
 
 ## Install
 
@@ -26,7 +43,12 @@ docxai add report.docx paragraph \
 docxai set report.docx @p3 --text "..."  # edit an existing paragraph
 docxai delete report.docx @p7            # remove an element
 docxai styles report.docx                # list available styles
+docxai add report.docx equation \
+    --latex "x^2 + y^2 = z^2"            # display equation (needs pandoc)
 ```
+
+If no `--style` is given, `add paragraph` uses the document's `Body` style when
+present, otherwise leaves the paragraph unstyled to inherit the document default.
 
 Run `docxai --help` and `docxai <verb> --help` for the full reference.
 

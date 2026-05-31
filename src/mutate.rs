@@ -980,24 +980,26 @@ fn find_element_open_end(bytes: &[u8], tag_prefix: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::doc::test_fixture::minimal_docx_bytes;
-    use std::io::Write as IoWrite;
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
 
-    fn load_doc() -> (NamedTempFile, Doc) {
-        let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(&minimal_docx_bytes()).unwrap();
-        tmp.flush().unwrap();
-        let doc = Doc::load(tmp.path()).unwrap();
-        (tmp, doc)
+    // Helpers write the fixture to a closed file inside a TempDir (rather than
+    // holding a NamedTempFile handle open) so that Doc::save's atomic replace
+    // succeeds on Windows, where renaming over an open file is denied.
+    fn load_doc() -> (TempDir, Doc) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.docx");
+        std::fs::write(&path, minimal_docx_bytes()).unwrap();
+        let doc = Doc::load(&path).unwrap();
+        (dir, doc)
     }
 
-    fn load_doc_with_xml(document_xml: &[u8]) -> (NamedTempFile, Doc) {
-        let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(&minimal_docx_bytes()).unwrap();
-        tmp.flush().unwrap();
-        let mut doc = Doc::load(tmp.path()).unwrap();
+    fn load_doc_with_xml(document_xml: &[u8]) -> (TempDir, Doc) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.docx");
+        std::fs::write(&path, minimal_docx_bytes()).unwrap();
+        let mut doc = Doc::load(&path).unwrap();
         doc.parts.document_xml = document_xml.to_vec();
-        (tmp, doc)
+        (dir, doc)
     }
 
     fn reindex_and_count_p(xml: &[u8]) -> u32 {
@@ -1546,7 +1548,7 @@ mod tests {
 
     // -- #22 set @tN.rR.cC --
 
-    fn load_doc_with_table() -> (NamedTempFile, Doc) {
+    fn load_doc_with_table() -> (TempDir, Doc) {
         let xml =
             br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:body><w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="0" w:type="auto"/></w:tblPr>

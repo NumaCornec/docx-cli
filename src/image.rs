@@ -417,14 +417,16 @@ mod tests {
     use super::*;
     use crate::doc::test_fixture::minimal_docx_bytes;
     use std::io::Write as IoWrite;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
-    fn load_doc() -> (NamedTempFile, Doc) {
-        let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(&minimal_docx_bytes()).unwrap();
-        tmp.flush().unwrap();
-        let doc = Doc::load(tmp.path()).unwrap();
-        (tmp, doc)
+    // Write the docx fixture to a closed file inside a TempDir (not an open
+    // NamedTempFile) so Doc::save's atomic replace works on Windows.
+    fn load_doc() -> (TempDir, Doc) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.docx");
+        std::fs::write(&path, minimal_docx_bytes()).unwrap();
+        let doc = Doc::load(&path).unwrap();
+        (dir, doc)
     }
 
     fn make_png(width: u32, height: u32) -> Vec<u8> {
